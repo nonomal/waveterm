@@ -3405,6 +3405,7 @@ class Model {
             .then((data) => {
                 mobx.action(() => {
                     let update = data.data;
+                    console.log("update", update)
                     if (update != null) {
                         this.runUpdate(update, interactive);
                     }
@@ -3685,6 +3686,15 @@ class Model {
             .then((data) => {
                 return;
             });
+    }
+
+    setLineState(
+        screenId: string,
+        lineId: string,
+        state: T.LineStateType,
+        interactive: boolean
+    ): Promise<CommandRtnType> {
+        return GlobalCommandRunner.setLineState(screenId, lineId, state, interactive);
     }
 }
 
