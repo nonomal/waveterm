@@ -173,13 +173,6 @@ class NewTabSettings extends React.Component<{ screen: Screen }, {}> {
                         required={true}
                         defaultValue={screen.name.get() ?? ""}
                         onChange={this.updateName}
-                        decoration={{
-                            endDecoration: (
-                                <InputDecoration>
-                                    <i className="fa-sharp fa-regular fa-circle-question"></i>
-                                </InputDecoration>
-                            ),
-                        }}
                     />
                 </div>
                 <div className="newtab-spacer" />
