@@ -190,6 +190,7 @@ func init() {
 	registerCmdFn("line:setheight", LineSetHeightCommand)
 	registerCmdFn("line:view", LineViewCommand)
 	registerCmdFn("line:set", LineSetCommand)
+	registerCmdFn("line:mergestate", LineMergeStateCommand)
 
 	registerCmdFn("client", ClientCommand)
 	registerCmdFn("client:show", ClientShowCommand)
@@ -2581,6 +2582,64 @@ func LineSetHeightCommand(ctx context.Context, pk *scpacket.FeCommandPacketType)
 	}
 	// we don't need to pass the updated line height (it is "write only")
 	return nil, nil
+}
+
+func LineMergeStateCommand(ctx context.Context, pk *scpacket.FeCommandPacketType) (sstore.UpdatePacket, error) {
+	ids, err := resolveUiIds(ctx, pk, R_Session|R_Screen)
+	if err != nil {
+		return nil, err
+	}
+	if len(pk.Args) != 1 {
+		return nil, fmt.Errorf("/line:set requires 1 argument (linearg)")
+	}
+	lineArg := pk.Args[0]
+	lineId, err := sstore.FindLineIdByArg(ctx, ids.ScreenId, lineArg)
+	if err != nil {
+		return nil, fmt.Errorf("error looking up lineid: %v", err)
+	}
+	newStateStr, found := pk.Kwargs[KwArgState]
+	if !found {
+		return nil, fmt.Errorf("/line:mergestate requires 'state' parameter")
+	}
+	var newStateMap map[string]any
+	err = json.Unmarshal([]byte(newStateStr), &newStateMap)
+	if err != nil {
+		return nil, fmt.Errorf("invalid state value, cannot parse json: %v", err)
+	}
+	line, err := sstore.GetLineById(ctx, ids.ScreenId, lineId)
+	if err != nil {
+		return nil, fmt.Errorf("cannot retrieve line: %v", err)
+	}
+	if line == nil {
+		return nil, fmt.Errorf("cannot retrieve line (not found)")
+	}
+	lineState := line.LineState
+	if lineState == nil {
+		lineState = make(map[string]any)
+	}
+	for key, val := range newStateMap {
+		if val == nil {
+			delete(lineState, key)
+		} else {
+			lineState[key] = val
+		}
+	}
+	err = sstore.UpdateLineState(ctx, ids.ScreenId, lineId, lineState)
+	if err != nil {
+		return nil, fmt.Errorf("cannot update linestate: %v", err)
+	}
+	updatedLine, err := sstore.GetLineById(ctx, ids.ScreenId, lineId)
+	if err != nil {
+		return nil, fmt.Errorf("cannot retrieve updated line: %v", err)
+	}
+	update := &sstore.ModelUpdate{
+		Line: updatedLine,
+		Info: &sstore.InfoMsgType{
+			InfoMsg:   fmt.Sprintf("line merged state"),
+			TimeoutMs: 2000,
+		},
+	}
+	return update, nil
 }
 
 func LineSetCommand(ctx context.Context, pk *scpacket.FeCommandPacketType) (sstore.UpdatePacket, error) {

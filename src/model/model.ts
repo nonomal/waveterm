@@ -127,8 +127,7 @@ type LineContainerModel = {
     getUsedRows: (context: RendererContext, line: LineType, cmd: Cmd, width: number) => number;
     getContentHeight: (context: RendererContext) => number;
     setContentHeight: (context: RendererContext, height: number) => void;
-    getMaxContentSize(): WindowSize;
-    getIdealContentSize(): WindowSize;
+    getRendererOpts(cmd: Cmd): T.RendererOpts;
 };
 
 type SWLinePtr = {
@@ -772,6 +771,15 @@ class Screen {
         return false;
     }
 
+    getRendererOpts(cmd: Cmd): T.RendererOpts {
+        return {
+            maxSize: this.getMaxContentSize(),
+            idealSize: this.getIdealContentSize(),
+            termOpts: cmd.getTermOpts(),
+            termFontSize: GlobalModel.termFontSize.get(),
+        };
+    }
+
     loadTerminalRenderer(elem: Element, line: LineType, cmd: Cmd, width: number) {
         let lineId = cmd.lineId;
         let termWrap = this.getTermWrap(lineId);
@@ -801,9 +809,19 @@ class Screen {
             customKeyHandler: this.termCustomKeyHandler.bind(this),
             fontSize: GlobalModel.termFontSize.get(),
             ptyDataSource: getTermPtyData,
+            lineState: line.linestate,
             onUpdateContentHeight: (termContext: RendererContext, height: number) => {
                 GlobalModel.setContentHeight(termContext, height);
             },
+            onUpdateUsedRows: (termContext: RendererContext, usedRows: number) => {
+                GlobalCommandRunner.mergeLineState(
+                    termContext.screenId,
+                    termContext.lineId,
+                    { usedrows: usedRows },
+                    false
+                );
+            },
+            rendererOpts: this.getRendererOpts(cmd),
         });
         this.terminals[lineId] = termWrap;
         if (this.focusType.get() == "cmd" && this.selectedLine.get() == line.linenum) {
@@ -835,15 +853,19 @@ class Screen {
         }
         let termWrap = this.getTermWrap(cmd.lineId);
         if (termWrap == null) {
-            let cols = windowWidthToCols(width, GlobalModel.termFontSize.get());
-            let usedRows = GlobalModel.getContentHeight(context);
+            let usedRows = line.linestate?.usedrows;
             if (usedRows != null) {
                 return usedRows;
             }
-            if (line.contentheight != null && line.contentheight != -1) {
-                return line.contentheight;
-            }
             return cmd.isRunning() ? 1 : 0;
+            // let usedRows = GlobalModel.getContentHeight(context);
+            // if (usedRows != null) {
+            //     return usedRows;
+            // }
+            // if (line.contentheight != null && line.contentheight != -1) {
+            //     return line.contentheight;
+            // }
+            // return cmd.isRunning() ? 1 : 0;
         }
         return termWrap.getUsedRows();
     }
@@ -1796,6 +1818,15 @@ class SpecialHistoryViewLineContainer {
         return { width, height };
     }
 
+    getRendererOpts(cmd: Cmd): T.RendererOpts {
+        return {
+            maxSize: this.getMaxContentSize(),
+            idealSize: this.getIdealContentSize(),
+            termOpts: cmd.getTermOpts(),
+            termFontSize: GlobalModel.termFontSize.get(),
+        };
+    }
+
     loadTerminalRenderer(elem: Element, line: LineType, cmd: Cmd, width: number): void {
         this.unloadRenderer(null);
         let lineId = cmd.lineId;
@@ -1822,10 +1853,13 @@ class SpecialHistoryViewLineContainer {
             dataHandler: null,
             focusHandler: null,
             isRunning: cmd.isRunning(),
+            lineState: line.linestate,
             customKeyHandler: null,
             fontSize: GlobalModel.termFontSize.get(),
             ptyDataSource: getTermPtyData,
             onUpdateContentHeight: null,
+            onUpdateUsedRows: null,
+            rendererOpts: this.getRendererOpts(cmd),
         });
         this.terminal = termWrap;
         return;
@@ -2654,6 +2688,19 @@ class RemotesModalModel {
         GlobalModel.sendInputPacket(inputPacket);
     }
 
+    getRendererOpts(): T.RendererOpts {
+        let fontSize = GlobalModel.termFontSize.get();
+        let width = termWidthFromCols(80, fontSize);
+        let height = termHeightFromRows(25, fontSize);
+        let termOpts = { rows: 25, cols: 25, flexrows: false };
+        return {
+            maxSize: { width, height },
+            idealSize: { width, height },
+            termOpts: termOpts,
+            termFontSize: fontSize,
+        };
+    }
+
     createTermWrap(elem: HTMLElement): void {
         this.disposeTerm();
         let remoteId = this.selectedRemoteId.get();
@@ -2678,7 +2725,10 @@ class RemotesModalModel {
             isRunning: true,
             fontSize: GlobalModel.termFontSize.get(),
             ptyDataSource: getTermPtyData,
+            lineState: null,
             onUpdateContentHeight: null,
+            onUpdateUsedRows: null,
+            rendererOpts: this.getRendererOpts(),
         });
         this.remoteTermWrap = termWrap;
     }
@@ -4105,6 +4155,22 @@ class CommandRunner {
         return GlobalModel.submitCommand(
             "line",
             "set",
+            [lineId],
+            { screen: screenId, nohist: "1", state: stateStr },
+            interactive
+        );
+    }
+
+    mergeLineState(
+        screenId: string,
+        lineId: string,
+        state: T.LineStateType,
+        interactive: boolean
+    ): Promise<CommandRtnType> {
+        let stateStr = JSON.stringify(state);
+        return GlobalModel.submitCommand(
+            "line",
+            "mergestate",
             [lineId],
             { screen: screenId, nohist: "1", state: stateStr },
             interactive

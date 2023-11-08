@@ -10,7 +10,7 @@ import localizedFormat from "dayjs/plugin/localizedFormat";
 import { If } from "tsx-control-statements/components";
 import { GlobalModel, LineContainerModel } from "../../model/model";
 import { termHeightFromRows } from "../../util/textmeasure";
-import type { LineType } from "../../types/types";
+import * as T from "../../types/types";
 import cn from "classnames";
 import * as lineutil from "../../app/line/lineutil";
 
@@ -26,12 +26,13 @@ type OMap<K, V> = mobx.ObservableMap<K, V>;
 class TerminalRenderer extends React.Component<
     {
         screen: LineContainerModel;
-        line: LineType;
+        line: T.LineType;
         width: number;
         staticRender: boolean;
         visible: OV<boolean>;
         onHeightChange: () => void;
         collapsed: boolean;
+        lineState: T.LineStateType;
     },
     {}
 > {

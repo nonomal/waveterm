@@ -15,6 +15,7 @@ import type {
     WindowSize,
     PtyDataType,
 } from "../../types/types";
+import * as T from "../../types/types";
 import { getTheme } from "../../app/common/themes/themes";
 
 type DataUpdate = {
@@ -38,6 +39,9 @@ type TermWrapOpts = {
     fontSize: number;
     ptyDataSource: (termContext: TermContextUnion) => Promise<PtyDataType>;
     onUpdateContentHeight: (termContext: RendererContext, height: number) => void;
+    onUpdateUsedRows: (termContext: RendererContext, usedRows: number) => void;
+    lineState: T.LineStateType;
+    rendererOpts: T.RendererOpts;
 };
 
 // cmd-instance
@@ -59,8 +63,10 @@ class TermWrap {
     isRunning: boolean;
     fontSize: number;
     onUpdateContentHeight: (termContext: RendererContext, height: number) => void;
+    onUpdateUsedRows: (termContext: RendererContext, usedRows: number) => void;
     ptyDataSource: (termContext: TermContextUnion) => Promise<PtyDataType>;
     initializing: boolean;
+    lineState: T.LineStateType;
 
     constructor(elem: Element, opts: TermWrapOpts) {
         opts = opts ?? ({} as any);
@@ -73,6 +79,8 @@ class TermWrap {
         this.fontSize = opts.fontSize;
         this.ptyDataSource = opts.ptyDataSource;
         this.onUpdateContentHeight = opts.onUpdateContentHeight;
+        this.onUpdateUsedRows = opts.onUpdateUsedRows;
+        this.lineState = opts.lineState ?? {};
         this.initializing = true;
         if (this.flexRows) {
             this.atRowMax = false;
@@ -239,7 +247,10 @@ class TermWrap {
             }
             this.usedRows.set(tur);
             if (this.onUpdateContentHeight != null) {
-                this.onUpdateContentHeight(termContext, tur);
+                // this.onUpdateContentHeight(termContext, tur);
+            }
+            if (this.onUpdateUsedRows != null) {
+                this.onUpdateUsedRows(termContext, tur);
             }
         })();
     }

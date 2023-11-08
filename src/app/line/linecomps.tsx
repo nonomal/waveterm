@@ -117,6 +117,7 @@ class LineCmd extends React.Component<
     {}
 > {
     lineRef: React.RefObject<any> = React.createRef();
+    rtnStateRef: React.RefObject<any> = React.createRef();
     cmdTextRef: React.RefObject<any> = React.createRef();
     rtnStateDiff: mobx.IObservableValue<string> = mobx.observable.box(null, {
         name: "linecmd-rtn-state-diff",
@@ -468,16 +469,6 @@ class LineCmd extends React.Component<
         );
     }
 
-    getRendererOpts(cmd: Cmd): RendererOpts {
-        let { screen } = this.props;
-        return {
-            maxSize: screen.getMaxContentSize(),
-            idealSize: screen.getIdealContentSize(),
-            termOpts: cmd.getTermOpts(),
-            termFontSize: GlobalModel.termFontSize.get(),
-        };
-    }
-
     makeRendererModelInitializeParams(): RendererModelInitializeParams {
         let { screen, line } = this.props;
         let context = lineutil.getRendererContext(line);
@@ -505,7 +496,7 @@ class LineCmd extends React.Component<
             context: context,
             isDone: !cmd.isRunning(),
             savedHeight: savedHeight,
-            opts: this.getRendererOpts(cmd),
+            opts: screen.getRendererOpts(cmd),
             ptyDataSource: getTermPtyData,
             lineState: line.linestate,
             api: api,
@@ -676,6 +667,7 @@ class LineCmd extends React.Component<
                                 visible={visible}
                                 onHeightChange={this.handleHeightChange}
                                 collapsed={false}
+                                lineState={line.linestate}
                             />
                         </If>
                         <If condition={rendererPlugin != null && rendererPlugin.rendererType == "simple"}>
@@ -708,6 +700,7 @@ class LineCmd extends React.Component<
                             style={{
                                 visibility: cmd.getStatus() == "done" ? "visible" : "hidden",
                             }}
+                            ref={this.rtnStateRef}
                         >
                             <If condition={rsdiff == null || rsdiff == ""}>
                                 <div className="cmd-rtnstate-label">state unchanged</div>
