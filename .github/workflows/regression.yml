@@ -1,0 +1,51 @@
+name: TestDriver.ai Regression Testing - Waveterm
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        branches:
+            - main
+    schedule:
+        - cron: 0 21 * * *
+    workflow_dispatch: null
+
+permissions:
+    contents: read # To allow the action to read repository contents
+    pull-requests: write # To allow the action to create/update pull request comments
+
+
+jobs:
+  test:
+    name: "TestDriver"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dashcamio/testdriver@main
+        id: testdriver
+        with:
+          version: v3.9.0
+          key: ${{secrets.DASHCAM_API}}
+          os: mac
+          prerun: |
+            cd ~/actions-runner/_work/testdriver/testdriver/
+            brew install go
+            brew tap scripthaus-dev/scripthaus
+            brew install corepack
+            brew install scripthaus
+            corepack enable
+            yarn install
+            scripthaus run build-backend
+            echo "Yarn"
+            yarn
+            echo "Rebuild"
+            scripthaus run electron-rebuild
+            echo "Webpack"
+            scripthaus run webpack-build
+            echo "Starting Electron"
+            scripthaus run electron 1>/dev/null 2>&1 &
+            echo "Electron Done"
+            cd /Users/ec2-user/Downloads/td/
+            npm rebuild
+            exit       
+          prompt: |
+            1. /run /Users/ec2-user/actions-runner/_work/testdriver/testdriver/.testdriver/wave1.yml

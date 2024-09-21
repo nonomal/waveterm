@@ -6,7 +6,7 @@ package shparse
 import (
 	"strings"
 
-	"github.com/wavetermdev/waveterm/wavesrv/pkg/utilfn"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/utilfn"
 )
 
 const (
@@ -17,6 +17,8 @@ const (
 	CompTypeVar         = "var"
 	CompTypeAssignment  = "assignment"
 	CompTypeBasic       = "basic"
+	CompTypeFile        = "file"
+	CompTypeDir         = "dir"
 )
 
 type CompletionPos struct {

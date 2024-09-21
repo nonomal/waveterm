@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -21,23 +20,31 @@ import (
 )
 
 const HomeVarName = "HOME"
-const DefaultMShellHome = "~/.mshell"
-const DefaultMShellName = "mshell"
-const MShellPathVarName = "MSHELL_PATH"
-const MShellHomeVarName = "MSHELL_HOME"
-const MShellInstallBinVarName = "MSHELL_INSTALLBIN_PATH"
+const DefaultWaveshellHome = "~/.mshell"
+const DefaultWaveshellName = "mshell"
+const WaveshellPathVarName = "MSHELL_PATH"
+const WaveshellHomeVarName = "MSHELL_HOME"
+const WaveshellInstallBinVarName = "MSHELL_INSTALLBIN_PATH"
 const SSHCommandVarName = "SSH_COMMAND"
-const MShellDebugVarName = "MSHELL_DEBUG"
+const WaveshellDebugVarName = "MSHELL_DEBUG"
 const SessionsDirBaseName = "sessions"
 const RcFilesDirBaseName = "rcfiles"
-const MShellVersion = "v0.3.0"
+const WaveshellVersion = "v0.7.0"
 const RemoteIdFile = "remoteid"
-const DefaultMShellInstallBinDir = "/opt/mshell/bin"
+const DefaultWaveshellInstallBinDir = "/opt/mshell/bin"
 const LogFileName = "mshell.log"
 const ForceDebugLog = false
 
 const DebugFlag_LogRcFile = "logrc"
-const LogRcFileName = "debug.rcfile"
+const DebugRcFileName = "debug.rcfile"
+const DebugReturnStateFileName = "debug.returnstate"
+
+const (
+	ProcessType_Unknown         = "unknown"
+	ProcessType_WaveSrv         = "wavesrv"
+	ProcessType_WaveShellSingle = "wsh-1"
+	ProcessType_WaveShellServer = "wsh-s"
+)
 
 // keys are sessionids (also the key RcFilesDirBaseName)
 var ensureDirCache = make(map[string]bool)
@@ -45,6 +52,8 @@ var baseLock = &sync.Mutex{}
 var DebugLogEnabled = false
 var DebugLogger *log.Logger
 var BuildTime string = "0"
+
+var ProcessType string = ProcessType_Unknown
 
 type CommandFileNames struct {
 	PtyOutFile    string
@@ -58,11 +67,15 @@ func SetBuildTime(build string) {
 	BuildTime = build
 }
 
-func MakeCommandKey(sessionId string, cmdId string) CommandKey {
-	if sessionId == "" && cmdId == "" {
+func IsWaveSrv() bool {
+	return ProcessType == ProcessType_WaveSrv
+}
+
+func MakeCommandKey(screenId string, lineId string) CommandKey {
+	if screenId == "" && lineId == "" {
 		return CommandKey("")
 	}
-	return CommandKey(fmt.Sprintf("%s/%s", sessionId, cmdId))
+	return CommandKey(fmt.Sprintf("%s/%s", screenId, lineId))
 }
 
 func (ckey CommandKey) IsEmpty() bool {
@@ -77,7 +90,7 @@ func Logf(fmtStr string, args ...interface{}) {
 }
 
 func InitDebugLog(prefix string) {
-	homeDir := GetMShellHomeDir()
+	homeDir := GetWaveshellHomeDir()
 	err := os.MkdirAll(homeDir, 0777)
 	if err != nil {
 		return
@@ -150,7 +163,7 @@ func (ckey CommandKey) Validate(typeStr string) error {
 }
 
 func HasDebugFlag(envMap map[string]string, flagName string) bool {
-	msDebug := envMap[MShellDebugVarName]
+	msDebug := envMap[WaveshellDebugVarName]
 	flags := strings.Split(msDebug, ",")
 	for _, flag := range flags {
 		if strings.TrimSpace(flag) == flagName {
@@ -161,8 +174,13 @@ func HasDebugFlag(envMap map[string]string, flagName string) bool {
 }
 
 func GetDebugRcFileName() string {
-	msHome := GetMShellHomeDir()
-	return path.Join(msHome, LogRcFileName)
+	wsHome := GetWaveshellHomeDir()
+	return path.Join(wsHome, DebugRcFileName)
+}
+
+func GetDebugReturnStateFileName() string {
+	wsHome := GetWaveshellHomeDir()
+	return path.Join(wsHome, DebugReturnStateFileName)
 }
 
 func GetHomeDir() string {
@@ -173,61 +191,16 @@ func GetHomeDir() string {
 	return homeVar
 }
 
-func GetMShellHomeDir() string {
-	homeVar := os.Getenv(MShellHomeVarName)
+func GetWaveshellHomeDir() string {
+	homeVar := os.Getenv(WaveshellHomeVarName)
 	if homeVar != "" {
 		return homeVar
 	}
-	return ExpandHomeDir(DefaultMShellHome)
-}
-
-func GetCommandFileNames(ck CommandKey) (*CommandFileNames, error) {
-	if err := ck.Validate("ck"); err != nil {
-		return nil, fmt.Errorf("cannot get command files: %w", err)
-	}
-	sessionId, cmdId := ck.Split()
-	sdir, err := EnsureSessionDir(sessionId)
-	if err != nil {
-		return nil, err
-	}
-	base := path.Join(sdir, cmdId)
-	return &CommandFileNames{
-		PtyOutFile:    base + ".ptyout",
-		StdinFifo:     base + ".stdin",
-		RunnerOutFile: base + ".runout",
-	}, nil
-}
-
-func CleanUpCmdFiles(sessionId string, cmdId string) error {
-	if cmdId == "" {
-		return fmt.Errorf("bad cmdid, cannot clean up")
-	}
-	sdir, err := EnsureSessionDir(sessionId)
-	if err != nil {
-		return err
-	}
-	cmdFileGlob := path.Join(sdir, cmdId+".*")
-	matches, err := filepath.Glob(cmdFileGlob)
-	if err != nil {
-		return err
-	}
-	for _, file := range matches {
-		rmErr := os.Remove(file)
-		if err == nil && rmErr != nil {
-			err = rmErr
-		}
-	}
-	return err
-}
-
-func GetSessionsDir() string {
-	mhome := GetMShellHomeDir()
-	sdir := path.Join(mhome, SessionsDirBaseName)
-	return sdir
+	return ExpandHomeDir(DefaultWaveshellHome)
 }
 
 func EnsureRcFilesDir() (string, error) {
-	mhome := GetMShellHomeDir()
+	mhome := GetWaveshellHomeDir()
 	dirName := path.Join(mhome, RcFilesDirBaseName)
 	err := CacheEnsureDir(dirName, RcFilesDirBaseName, 0700, "rcfiles dir")
 	if err != nil {
@@ -236,36 +209,18 @@ func EnsureRcFilesDir() (string, error) {
 	return dirName, nil
 }
 
-func EnsureSessionDir(sessionId string) (string, error) {
-	if sessionId == "" {
-		return "", fmt.Errorf("Bad sessionid, cannot be empty")
+func GetWaveshellPath() (string, error) {
+	wsPath := os.Getenv(WaveshellPathVarName) // use MSHELL_PATH -- will require rename
+	if wsPath != "" {
+		return exec.LookPath(wsPath)
 	}
-	mhome := GetMShellHomeDir()
-	sdir := path.Join(mhome, SessionsDirBaseName, sessionId)
-	err := CacheEnsureDir(sdir, sessionId, 0777, "mshell session dir")
-	if err != nil {
-		return "", err
-	}
-	return sdir, nil
-}
-
-func GetMShellPath() (string, error) {
-	msPath := os.Getenv(MShellPathVarName) // use MSHELL_PATH
-	if msPath != "" {
-		return exec.LookPath(msPath)
-	}
-	mhome := GetMShellHomeDir()
-	userMShellPath := path.Join(mhome, DefaultMShellName) // look in ~/.mshell
-	msPath, err := exec.LookPath(userMShellPath)
+	mhome := GetWaveshellHomeDir()
+	userWaveshellPath := path.Join(mhome, DefaultWaveshellName) // look in ~/.mshell -- will require rename
+	wsPath, err := exec.LookPath(userWaveshellPath)
 	if err == nil {
-		return msPath, nil
+		return wsPath, nil
 	}
-	return exec.LookPath(DefaultMShellName) // standard path lookup for 'mshell'
-}
-
-func GetMShellSessionsDir() (string, error) {
-	mhome := GetMShellHomeDir()
-	return path.Join(mhome, SessionsDirBaseName), nil
+	return exec.LookPath(DefaultWaveshellName) // standard path lookup for 'mshell'-- will require rename
 }
 
 func ExpandHomeDir(pathStr string) string {
@@ -284,9 +239,9 @@ func ValidGoArch(goos string, goarch string) bool {
 }
 
 func GoArchOptFile(version string, goos string, goarch string) string {
-	installBinDir := os.Getenv(MShellInstallBinVarName)
+	installBinDir := os.Getenv(WaveshellInstallBinVarName)
 	if installBinDir == "" {
-		installBinDir = DefaultMShellInstallBinDir
+		installBinDir = DefaultWaveshellInstallBinDir
 	}
 	versionStr := semver.MajorMinor(version)
 	if versionStr == "" {
@@ -296,39 +251,23 @@ func GoArchOptFile(version string, goos string, goarch string) string {
 	return fmt.Sprintf(path.Join(installBinDir, binBaseName))
 }
 
-func MShellBinaryFromOptDir(version string, goos string, goarch string) (io.ReadCloser, error) {
-	if !ValidGoArch(goos, goarch) {
-		return nil, fmt.Errorf("invalid goos/goarch combination: %s/%s", goos, goarch)
-	}
-	versionStr := semver.MajorMinor(version)
-	if versionStr == "" {
-		return nil, fmt.Errorf("invalid mshell version: %q", version)
-	}
-	fileName := GoArchOptFile(version, goos, goarch)
-	fd, err := os.Open(fileName)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open mshell binary %q: %v", fileName, err)
-	}
-	return fd, nil
-}
-
 func GetRemoteId() (string, error) {
-	mhome := GetMShellHomeDir()
-	homeInfo, err := os.Stat(mhome)
+	wsHome := GetWaveshellHomeDir()
+	homeInfo, err := os.Stat(wsHome)
 	if errors.Is(err, fs.ErrNotExist) {
-		err = os.MkdirAll(mhome, 0777)
+		err = os.MkdirAll(wsHome, 0777)
 		if err != nil {
-			return "", fmt.Errorf("cannot make mshell home directory[%s]: %w", mhome, err)
+			return "", fmt.Errorf("cannot make waveshell home directory[%s]: %w", wsHome, err)
 		}
-		homeInfo, err = os.Stat(mhome)
+		homeInfo, err = os.Stat(wsHome)
 	}
 	if err != nil {
-		return "", fmt.Errorf("cannot stat mshell home directory[%s]: %w", mhome, err)
+		return "", fmt.Errorf("cannot stat waveshell home directory[%s]: %w", wsHome, err)
 	}
 	if !homeInfo.IsDir() {
-		return "", fmt.Errorf("mshell home directory[%s] is not a directory", mhome)
+		return "", fmt.Errorf("waveshell home directory[%s] is not a directory", wsHome)
 	}
-	remoteIdFile := path.Join(mhome, RemoteIdFile)
+	remoteIdFile := path.Join(wsHome, RemoteIdFile)
 	fd, err := os.Open(remoteIdFile)
 	if errors.Is(err, fs.ErrNotExist) {
 		// write the file

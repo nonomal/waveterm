@@ -18,13 +18,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wavetermdev/waveterm/waveshell/pkg/shellapi"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/dbutil"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/rtnstate"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbase"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/sstore"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/telemetry"
 )
 
-const PCloudEndpoint = "https://api.getprompt.dev/central"
+const PCloudEndpoint = "https://api.waveterm.dev/central"
 const PCloudEndpointVarName = "PCLOUD_ENDPOINT"
 const APIVersion = 1
 const MaxPtyUpdateSize = (128 * 1024)
@@ -33,6 +35,9 @@ const MaxUpdatesToDeDup = 1000
 const MaxUpdateWriterErrors = 3
 const PCloudDefaultTimeout = 5 * time.Second
 const PCloudWebShareUpdateTimeout = 15 * time.Second
+
+const PCloudWSEndpoint = "wss://wsapi.waveterm.dev/"
+const PCloudWSEndpointVarName = "PCLOUD_WS_ENDPOINT"
 
 // setting to 1M to be safe (max is 6M for API-GW + Lambda, but there is base64 encoding and upload time)
 // we allow one extra update past this estimated size
@@ -61,6 +66,18 @@ func GetEndpoint() string {
 		panic("Invalid PCloud dev endpoint, PCLOUD_ENDPOINT not set or invalid")
 	}
 	return endpoint
+}
+
+func GetWSEndpoint() string {
+	if !scbase.IsDevMode() {
+		return PCloudWSEndpoint
+	} else {
+		endpoint := os.Getenv(PCloudWSEndpointVarName)
+		if endpoint == "" {
+			panic("Invalid PCloud ws dev endpoint, PCLOUD_WS_ENDPOINT not set or invalid")
+		}
+		return endpoint
+	}
 }
 
 func makeAuthPostReq(ctx context.Context, apiUrl string, authInfo AuthInfo, data interface{}) (*http.Request, error) {
@@ -140,7 +157,7 @@ func SendTelemetry(ctx context.Context, force bool) error {
 	if !force && clientData.ClientOpts.NoTelemetry {
 		return nil
 	}
-	activity, err := sstore.GetNonUploadedActivity(ctx)
+	activity, err := telemetry.GetNonUploadedActivity(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot get activity: %v", err)
 	}
@@ -148,8 +165,16 @@ func SendTelemetry(ctx context.Context, force bool) error {
 		return nil
 	}
 	log.Printf("[pcloud] sending telemetry data\n")
-	dayStr := sstore.GetCurDayStr()
-	input := TelemetryInputType{UserId: clientData.UserId, ClientId: clientData.ClientId, CurDay: dayStr, Activity: activity}
+	dayStr := telemetry.GetCurDayStr()
+	defaultShellType := shellapi.DetectLocalShellType()
+	input := TelemetryInputType{
+		UserId:       clientData.UserId,
+		ClientId:     clientData.ClientId,
+		AppType:      "wave",
+		CurDay:       dayStr,
+		DefaultShell: defaultShellType,
+		Activity:     activity,
+	}
 	req, err := makeAnonPostReq(ctx, TelemetryUrl, input)
 	if err != nil {
 		return err
@@ -158,7 +183,7 @@ func SendTelemetry(ctx context.Context, force bool) error {
 	if err != nil {
 		return err
 	}
-	err = sstore.MarkActivityAsUploaded(ctx, activity)
+	err = telemetry.MarkActivityAsUploaded(ctx, activity)
 	if err != nil {
 		return fmt.Errorf("error marking activity as uploaded: %v", err)
 	}

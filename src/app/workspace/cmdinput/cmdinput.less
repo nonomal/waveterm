@@ -1,434 +1,207 @@
-@import "../../../app/common/themes/themes.less";
+@import "@/common/icons/icons.less";
 
 .cmd-input {
-    border-radius: 6px;
     max-height: max(300px, 40%);
     display: flex;
     flex-direction: column;
-    position: absolute;
-    bottom: 12px;
-    right: 12px;
-    width: calc(100% - 24px);
-    padding: 12px;
-    padding-bottom: 6px;
+    width: 100%;
     z-index: 100;
-    background: @background-session-components;
-    box-shadow: 0px 1px 3px 0px rgba(0, 0, 0, 0.5), 0px 3px 8px 0px rgba(0, 0, 0, 0.35),
-        0px 0px 0.5px 0px rgba(255, 255, 255, 0.5) inset, 0px 0.5px 0px 0px rgba(255, 255, 255, 0.2) inset;
-    backdrop-filter: blur(20px);
-    border: 1px solid transparent;
+    border-top: 2px solid var(--app-border-color);
+    background-color: var(--app-bg-color);
+    position: relative;
 
-    &.active {
-        border: 1px solid rgba(@wave-green, 0.8) !important;
-        box-shadow: 0px 0px 0.5px 0px rgba(255, 255, 255, 0.5) inset, 0px 0.5px 0px 0px rgba(255, 255, 255, 0.2) inset;
+    // Apply a border between the base cmdinput and any views shown above it
+    // TODO: use a generic selector for this
+    // &.has-aichat,
+    &.has-aicmdinfo,
+    &.has-history,
+    &.has-info,
+    &.has-suggestions {
+        .base-cmdinput {
+            border-top: 1px solid var(--app-border-color);
+        }
     }
 
-    &.has-info {
-        padding-top: 10px;
-    }
-
-    .focus-indicator {
-        height: 90%;
-        top: 5%;
-        left: 4px;
-    }
-
+    // &.has-aichat,
     &.has-history {
-        padding-top: 5px;
-        height: max(300px, 40%);
-    }
-
-    &.has-remote {
-        max-height: max(300px, 70%);
+        height: max(300px, 70%);
     }
 
     .remote-status-warning {
         display: flex;
         flex-direction: row;
-        color: @term-yellow;
+        color: var(--app-warning-color);
         align-items: center;
+        padding: var(--termpad) calc(var(--termpad) * 2) 0 calc(var(--termpad) * 2);
+        margin-left: 2px;
 
+        .wave-button,
         .button {
             margin-left: 10px;
+            padding: 4px 10px;
         }
-
-        .remote-name {
-        }
-    }
-
-    .input-minmax-control {
-        position: absolute;
-        top: 5px;
-        right: 5px;
-        color: @term-white;
-
-        padding: 5px;
-        cursor: pointer;
     }
 
     .cmd-input-grow-spacer {
         flex-grow: 1;
     }
 
-    .cmd-input-context {
-        color: #fff;
-        white-space: nowrap;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-
-    .cmd-input-filter {
-        opacity: 0.5;
-        &:hover {
-            opacity: 1.0;
-        }
-
-        .avatar {
-            display: inline-block;
-            width: 1em;
-            height: 1em;
-            margin: 0 0.5em;
-            vertical-align: text-top;
-            fill: @base-color;
-        }
-
-        .warning {
-            fill: @warning-yellow;
-        }
-
-        @keyframes infiniteRotate {
-            0% {
-                transform: rotate(0deg);
-            }
-            100% {
-                transform: rotate(360deg);
-            }
-        }
-
-        .spin {
-            animation: infiniteRotate 2s linear infinite;
-        }
-    }
-
-    .cmd-input-field {
+    .base-cmdinput {
         position: relative;
-        padding-right: 17em;
+        // Rather than apply the padding to the whole container, we will apply it to the inner contents directly.
+        // This is more fragile, but allows us to capture a larger target area for the individual components.
+        --padding-top: var(--termpad);
+        --padding-sides: calc(var(--termpad) * 2);
 
-        .cmd-hints {
-            position: absolute;
-            bottom: -14px;
-            right: 0px;
-        }
-        .control {
-            padding: 1em 2px;
+        .cmd-input-context {
+            color: var(--term-bright-white);
+            white-space: nowrap;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-family: var(--termfontfamily);
+            font-size: var(--termfontsize);
+            line-height: var(--termlineheight);
+
+            // We don't want to pad the bottom or it will push the input field down.
+            padding: var(--padding-top) var(--padding-sides) 0 var(--padding-sides);
+            margin-left: 2px;
         }
 
-        textarea {
-            color: @term-bright-white;
-            background-color: @textarea-background;
-            padding: 0.5em;
-            resize: none;
-            overflow: auto;
-            overflow-wrap: anywhere;
-            border-color: transparent;
+        .cmd-input-field {
+            position: relative;
+            font-family: var(--termfontfamily);
+            font-weight: normal;
+            line-height: var(--termlineheight);
+            font-size: var(--termfontsize);
             border: none;
-            font-family: @terminal-font;
-            &.display-disabled {
-                background-color: #444;
+            cursor: text;
+
+            // We don't want to pad the top or it will push the input field down.
+            padding: 0 var(--padding-sides) var(--padding-top) var(--padding-sides);
+
+            .cmd-hints {
+                position: absolute;
+                bottom: -14px;
+                right: 0px;
+            }
+            .control {
+                padding: 1em 2px;
             }
 
-            &:focus {
-                box-shadow: none;
+            .textareainput-div {
+                position: relative;
+
+                &.control {
+                    padding: var(--termpad) 0;
+                }
+
+                .shelltag {
+                    position: absolute;
+                    // 13px = 10px height + 3px padding.  subtract termpad to account for textareainput-div padding (2px not sure?)
+                    bottom: calc(-13px + var(--termpad));
+                    right: 0;
+                    font-size: 10px;
+                    color: var(--app-text-secondary-color);
+                    line-height: 1;
+                    user-select: none;
+                }
+            }
+
+            .textarea,
+            .textarea-ghost {
+                position: absolute;
+                top: 0;
+                left: 0;
+                padding: var(--termpad) 0;
+                resize: none;
+                overflow: auto;
+                overflow-wrap: anywhere;
+                font-family: var(--termfontfamily);
+                line-height: var(--termlineheight);
+                font-size: var(--termfontsize);
+                background-color: transparent;
                 border: none;
+                box-shadow: none;
+            }
+
+            .textarea {
+                color: var(--app-text-primary-color);
+                z-index: 2;
+            }
+
+            .textarea-ghost {
+                color: var(--cmdinput-ghost-text-color);
+                z-index: 1;
+            }
+
+            input.history-input {
+                border: 0;
+                padding: 0;
+                height: 0;
+            }
+
+            .cmd-quick-context .button {
+                background-color: var(--app-bg-color) !important;
+                color: var(--app-text-color);
+            }
+
+            &.inputmode-global .cmd-quick-context .button {
+                color: var(--app-bg-color);
+                background-color: var(--cmdinput-button-bg-color) !important;
+            }
+
+            &.inputmode-comment .cmd-quick-context .button {
+                color: var(--app-bg-color);
+                background-color: var(--cmdinput-comment-button-bg-color) !important;
             }
         }
 
-        input.history-input {
-            border: 0;
-            padding: 0;
-            height: 0;
-        }
-
-        .cmd-quick-context .button {
-            background-color: #000 !important;
-            color: @term-white;
-        }
-
-        &.inputmode-global .cmd-quick-context .button {
-            color: @term-black;
-            background-color: @tab-green !important;
-        }
-
-        &.inputmode-comment .cmd-quick-context .button {
-            color: @term-black;
-            background-color: @tab-blue !important;
-        }
-
-        .cmd-exec {
+        .cmdinput-actions {
             position: absolute;
-            right: 0;
-            .icon {
-                vertical-align: bottom;
-                margin-right: 1em;
-                width: 2.5em;
-                height: 2.5em;
-                cursor: pointer;
-                border-radius: 50%;
-                fill: @wave-green;
-                padding: 0.25em;
-            }
-            .icon.disabled {
-                fill: @disabled-background;
-                cursor: default;
-            }
-            .cmd-btn {
-                display: inline-block;
-                margin-right: 0;
-                padding: 0.2em 0.7rem;
+            font-size: calc(var(--termfontsize) + 2px);
+            line-height: 1.2;
+
+            // Align to the same bounds as the input field
+            top: var(--padding-top);
+            right: var(--padding-sides);
+
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+
+            .cmdinput-icon {
+                display: inline-flex;
+                color: var(--app-icon-hover-color);
                 opacity: 0.5;
-                cursor: pointer;
-                border-radius: 4px;
-                vertical-align: super;
+
+                .centered-icon {
+                    .positional-icon-visible;
+                }
+
+                &.running-cmds {
+                    .rotate {
+                        fill: var(--app-warning-color);
+                    }
+                }
+
+                &.active {
+                    opacity: 1;
+                }
+
                 &:hover {
                     opacity: 1;
                 }
-            }
-        }
-    }
 
-    .cmd-history {
-        color: @term-white;
-        margin-bottom: 5px;
-        overflow: auto;
-        flex-shrink: 1;
-
-        .history-title {
-            position: absolute;
-            z-index: 102;
-            top: 5px;
-            left: 20px;
-            background-color: @background-session-components-solid;
-            color: @soft-blue;
-            padding-bottom: 4px;
-            display: flex;
-            flex-direction: row;
-            width: calc(100% - 40px);
-            overflow-x: auto;
-
-            .history-opt {
-                white-space: nowrap;
-            }
-
-            .history-clickable-opt {
-                white-space: nowrap;
+                // This aligns the icons with the prompt field.
+                // We don't need right margin because the whole input field is already padded.
+                margin: 2px 0 0 12px;
                 cursor: pointer;
             }
 
-            .grow-spacer {
-                flex: 1 0 10px;
+            .line-icon + .line-icon:not(.line-icon-shrink-left) {
+                margin-left: 3px;
             }
-
-            .spacer {
-                flex: 0 0 10px;
-            }
-        }
-
-        .history-items {
-            margin-top: 24px;
-            color: @term-white;
-
-            padding-bottom: 6px;
-
-            .history-line {
-                white-space: pre;
-            }
-
-            .history-item.history-haderror {
-                color: mix(@term-red, @term-white, 50%);
-            }
-
-            .history-line:first-child {
-                margin-left: 0 !important;
-            }
-
-            .history-item {
-                padding-left: 5px;
-                cursor: pointer;
-
-                &:hover {
-                    background-color: #222;
-                }
-            }
-
-            .history-item.is-selected {
-                font-weight: bold;
-                color: @term-bright-white;
-                background-color: #444;
-            }
-
-            .history-item.is-selected.history-haderror {
-                color: mix(@term-bright-red, @term-bright-white, 50%);
-            }
-        }
-    }
-
-    .cmd-input-info {
-        flex-shrink: 1;
-        overflow-y: auto;
-        margin-bottom: 5px;
-
-        .info-msg {
-            color: @soft-blue;
-            padding-bottom: 2px;
-
-            a {
-                color: @term-blue;
-            }
-        }
-
-        .info-title {
-            color: @soft-blue;
-            padding-bottom: 2px;
-        }
-
-        .info-lines {
-            color: @term-white;
-            white-space: pre;
-            padding-bottom: 6px;
-        }
-
-        .info-comps {
-            display: flex;
-            flex-direction: row;
-            flex-wrap: wrap;
-            padding-bottom: 5px;
-
-            .info-comp {
-                min-width: 200px;
-                color: @term-white;
-                margin-right: 10px;
-
-                &.has-space {
-                    text-decoration: underline dotted #777;
-                }
-            }
-
-            .metacmd-comp {
-                color: @term-bright-green;
-            }
-        }
-
-        .info-error {
-            color: @term-red;
-            padding-bottom: 2px;
-        }
-
-        .info-remote-showall {
-            table.remotes-table {
-                th {
-                    color: @term-white;
-                    font-weight: bold;
-                }
-
-                th,
-                td {
-                    padding: 3px 8px 3px 8px;
-                }
-
-                td {
-                    cursor: pointer;
-                }
-
-                tr:hover td {
-                    background-color: #333;
-                }
-            }
-        }
-
-        .info-remote {
-            color: #d3d7cf;
-
-            .info-remote-title {
-                font-weight: bold;
-                color: @term-cyan;
-            }
-
-            .info-error,
-            .info-msg {
-                margin-top: 5px;
-                padding: 5px;
-            }
-
-            .remote-field {
-                display: flex;
-                flex-direction: row;
-
-                .remote-field-def {
-                    white-space: pre;
-                    width: 120px;
-                }
-
-                .remote-field-val {
-                    white-space: pre;
-                    display: flex;
-                    flex-direction: row;
-                }
-            }
-
-            .remote-input-field {
-                display: flex;
-                flex-direction: row;
-                height: 25px;
-                align-items: center;
-
-                .remote-field-label {
-                    white-space: pre;
-                    width: 140px;
-                    font-weight: bold;
-                    color: @term-bright-white;
-                }
-
-                .undo-icon {
-                    margin-left: 4px;
-                    cursor: pointer;
-                    padding: 2px;
-                }
-
-                .remote-field-control {
-                    &.text-control {
-                    }
-
-                    &.text-input {
-                        input[type="text"],
-                        input[type="number"],
-                        input[type="password"] {
-                            background-color: @term-black;
-                            color: @term-white;
-                            width: 200px;
-                        }
-                    }
-
-                    &.checkbox-input {
-                        input[type="checkbox"] {
-                            position: relative;
-                            top: 3px;
-                        }
-                    }
-
-                    &.select-input {
-                        select {
-                            width: 200px;
-                            background-color: @term-black;
-                            color: @term-white;
-                        }
-                    }
-                }
-            }
-        }
-
-        .info-remote-showall {
-            color: #d3d7cf;
         }
     }
 }

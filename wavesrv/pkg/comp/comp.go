@@ -15,9 +15,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/wavetermdev/waveterm/waveshell/pkg/simpleexpand"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/utilfn"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/shparse"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/sstore"
-	"github.com/wavetermdev/waveterm/wavesrv/pkg/utilfn"
 	"mvdan.cc/sh/v3/syntax"
 )
 
@@ -482,8 +482,8 @@ func splitCompWord(p *CompPoint) {
 
 	w1 := ParsedWord{Offset: w.Offset, Prefix: w.Prefix[:prefixPos]}
 	w2 := ParsedWord{Offset: w.Offset + prefixPos, Prefix: w.Prefix[prefixPos:], Word: w.Word, PartialWord: w.PartialWord}
-	p.CompWord = p.CompWord // the same (w1)
-	p.CompWordPos = 0       // will be at 0 since w1 has a word length of 0
+	// p.CompWord = p.CompWord // the same (w1)
+	p.CompWordPos = 0 // will be at 0 since w1 has a word length of 0
 	var newWords []ParsedWord
 	if p.CompWord > 0 {
 		newWords = append(newWords, p.Words[0:p.CompWord]...)
@@ -507,6 +507,12 @@ func getCompType(compPos shparse.CompletionPos) string {
 	case shparse.CompTypeArg, shparse.CompTypeBasic, shparse.CompTypeAssignment:
 		return CGTypeFile
 
+	case shparse.CompTypeDir:
+		return CGTypeDir
+
+	case shparse.CompTypeFile:
+		return CGTypeFile
+
 	default:
 		return CGTypeFile
 	}
@@ -515,11 +521,9 @@ func getCompType(compPos shparse.CompletionPos) string {
 func fixupVarPrefix(varPrefix string) string {
 	if strings.HasPrefix(varPrefix, "${") {
 		varPrefix = varPrefix[2:]
-		if strings.HasSuffix(varPrefix, "}") {
-			varPrefix = varPrefix[:len(varPrefix)-1]
-		}
-	} else if strings.HasPrefix(varPrefix, "$") {
-		varPrefix = varPrefix[1:]
+		varPrefix = strings.TrimSuffix(varPrefix, "}")
+	} else {
+		varPrefix = strings.TrimPrefix(varPrefix, "$")
 	}
 	return varPrefix
 }

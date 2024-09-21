@@ -1,13 +1,11 @@
-// Copyright 2023, Command Line Inc.
+// Copyright 2024, Command Line Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 import * as mobx from "mobx";
 import { sprintf } from "sprintf-js";
 import dayjs from "dayjs";
 import localizedFormat from "dayjs/plugin/localizedFormat";
-import type { RemoteType, CommandRtnType } from "../types/types";
-
-type OV<V> = mobx.IObservableValue<V>;
+import base64 from "base64-js";
 
 dayjs.extend(localizedFormat);
 
@@ -15,8 +13,15 @@ function isBlank(s: string): boolean {
     return s == null || s == "";
 }
 
+function isArray(obj: any): boolean {
+    if (obj == null) {
+        return false;
+    }
+    return Array.isArray(obj) || mobx.isObservableArray(obj);
+}
+
 function handleNotOkResp(resp: any, url: URL): Promise<any> {
-    let errMsg = sprintf(
+    const errMsg = sprintf(
         "Bad status code response from fetch '%s': code=%d %s",
         url.toString(),
         resp.status,
@@ -40,19 +45,23 @@ function handleNotOkResp(resp: any, url: URL): Promise<any> {
 }
 
 function fetchJsonData(resp: any, ctErr: boolean): Promise<any> {
-    let contentType = resp.headers.get("Content-Type");
-    if (contentType != null && contentType.startsWith("application/json")) {
+    const contentType = resp.headers.get("Content-Type");
+    if (contentType?.startsWith("application/json")) {
         return resp.text().then((textData) => {
             let rtnData: any = null;
             try {
                 rtnData = JSON.parse(textData);
             } catch (err) {
-                let errMsg = sprintf("Unparseable JSON: " + err.message);
-                let rtnErr = new Error(errMsg);
+                const errMsg = sprintf("Unparseable JSON: " + err.message);
+                const rtnErr = new Error(errMsg);
                 throw rtnErr;
             }
-            if (rtnData != null && rtnData.error) {
-                throw new Error(rtnData.error);
+            if (rtnData?.error) {
+                let err = new Error(rtnData.error);
+                if (rtnData.errorcode) {
+                    err["errorcode"] = rtnData.errorcode;
+                }
+                throw err;
             }
             return rtnData;
         });
@@ -66,13 +75,23 @@ function handleJsonFetchResponse(url: URL, resp: any): Promise<any> {
     if (!resp.ok) {
         return handleNotOkResp(resp, url);
     }
-    let rtnData = fetchJsonData(resp, true);
+    const rtnData = fetchJsonData(resp, true);
     return rtnData;
 }
 
+function base64ToString(b64: string): string {
+    const stringBytes = base64.toByteArray(b64);
+    return new TextDecoder().decode(stringBytes);
+}
+
+function stringToBase64(input: string): string {
+    const stringBytes = new TextEncoder().encode(input);
+    return base64.fromByteArray(stringBytes);
+}
+
 function base64ToArray(b64: string): Uint8Array {
-    let rawStr = atob(b64);
-    let rtnArr = new Uint8Array(new ArrayBuffer(rawStr.length));
+    const rawStr = atob(b64);
+    const rtnArr = new Uint8Array(new ArrayBuffer(rawStr.length));
     for (let i = 0; i < rawStr.length; i++) {
         rtnArr[i] = rawStr.charCodeAt(i);
     }
@@ -81,7 +100,6 @@ function base64ToArray(b64: string): Uint8Array {
 
 interface IDataType {
     remove?: boolean;
-    full?: boolean;
 }
 
 interface IObjType<DataType> {
@@ -102,31 +120,28 @@ function genMergeSimpleData<T extends ISimpleDataType>(
     if (dataArr == null || dataArr.length == 0) {
         return;
     }
-    let objMap: Record<string, T> = {};
-    for (let i = 0; i < objs.length; i++) {
-        let obj = objs[i];
-        let id = idFn(obj);
+    const objMap: Record<string, T> = {};
+    for (const obj of objs) {
+        const id = idFn(obj);
         objMap[id] = obj;
     }
-    for (let i = 0; i < dataArr.length; i++) {
-        let dataItem = dataArr[i];
+    for (const dataItem of dataArr) {
         if (dataItem == null) {
             console.log("genMergeSimpleData, null item");
             console.trace();
         }
-        let id = idFn(dataItem);
+        const id = idFn(dataItem);
         if (dataItem.remove) {
             delete objMap[id];
-            continue;
         } else {
             objMap[id] = dataItem;
         }
     }
-    let newObjs = Object.values(objMap);
+    const newObjs = Object.values(objMap);
     if (sortIdxFn) {
         newObjs.sort((a, b) => {
-            let astr = sortIdxFn(a);
-            let bstr = sortIdxFn(b);
+            const astr = sortIdxFn(a);
+            const bstr = sortIdxFn(b);
             return astr.localeCompare(bstr);
         });
     }
@@ -144,20 +159,18 @@ function genMergeData<ObjType extends IObjType<DataType>, DataType extends IData
     if (dataArr == null || dataArr.length == 0) {
         return;
     }
-    let objMap: Record<string, ObjType> = {};
-    for (let i = 0; i < objs.length; i++) {
-        let obj = objs[i];
-        let id = objIdFn(obj);
+    const objMap: Record<string, ObjType> = {};
+    for (const obj of objs) {
+        const id = objIdFn(obj);
         objMap[id] = obj;
     }
-    for (let i = 0; i < dataArr.length; i++) {
-        let dataItem = dataArr[i];
+    for (const dataItem of dataArr) {
         if (dataItem == null) {
             console.log("genMergeData, null item");
             console.trace();
             continue;
         }
-        let id = dataIdFn(dataItem);
+        const id = dataIdFn(dataItem);
         let obj = objMap[id];
         if (dataItem.remove) {
             if (obj != null) {
@@ -167,17 +180,13 @@ function genMergeData<ObjType extends IObjType<DataType>, DataType extends IData
             continue;
         }
         if (obj == null) {
-            if (!dataItem.full) {
-                console.log("cannot create object, dataitem is not full", objs, dataItem);
-                continue;
-            }
             obj = ctorFn(dataItem);
             objMap[id] = obj;
             continue;
         }
         obj.mergeData(dataItem);
     }
-    let newObjs = Object.values(objMap);
+    const newObjs = Object.values(objMap);
     if (sortIdxFn) {
         newObjs.sort((a, b) => {
             return sortIdxFn(a) - sortIdxFn(b);
@@ -193,18 +202,17 @@ function genMergeDataMap<ObjType extends IObjType<DataType>, DataType extends ID
     dataIdFn: (data: DataType) => string,
     ctorFn: (data: DataType) => ObjType
 ): { added: string[]; removed: string[] } {
-    let rtn: { added: string[]; removed: string[] } = { added: [], removed: [] };
+    const rtn: { added: string[]; removed: string[] } = { added: [], removed: [] };
     if (dataArr == null || dataArr.length == 0) {
         return rtn;
     }
-    for (let i = 0; i < dataArr.length; i++) {
-        let dataItem = dataArr[i];
+    for (const dataItem of dataArr) {
         if (dataItem == null) {
             console.log("genMergeDataMap, null item");
             console.trace();
             continue;
         }
-        let id = dataIdFn(dataItem);
+        const id = dataIdFn(dataItem);
         let obj = objMap.get(id);
         if (dataItem.remove) {
             if (obj != null) {
@@ -215,36 +223,12 @@ function genMergeDataMap<ObjType extends IObjType<DataType>, DataType extends ID
             continue;
         }
         if (obj == null) {
-            if (!dataItem.full) {
-                console.log("cannot create object, dataitem is not full", dataItem);
-                continue;
-            }
             obj = ctorFn(dataItem);
             objMap.set(id, obj);
             rtn.added.push(id);
             continue;
         }
         obj.mergeData(dataItem);
-    }
-    return rtn;
-}
-
-function parseEnv0(envStr64: string): Map<string, string> {
-    let envStr = atob(envStr64);
-    let parts = envStr.split("\x00");
-    let rtn: Map<string, string> = new Map();
-    for (let i = 0; i < parts.length; i++) {
-        let part = parts[i];
-        if (part == "") {
-            continue;
-        }
-        let eqIdx = part.indexOf("=");
-        if (eqIdx == -1) {
-            continue;
-        }
-        let varName = part.substr(0, eqIdx);
-        let varVal = part.substr(eqIdx + 1);
-        rtn.set(varName, varVal);
     }
     return rtn;
 }
@@ -269,35 +253,6 @@ function incObs(inum: mobx.IObservableValue<number>) {
     })();
 }
 
-// @check:font
-function loadFonts() {
-    let jbmFontNormal = new FontFace("JetBrains Mono", "url('public/fonts/jetbrains-mono-v13-latin-regular.woff2')", {
-        style: "normal",
-        weight: "400",
-    });
-    let jbmFont200 = new FontFace("JetBrains Mono", "url('public/fonts/jetbrains-mono-v13-latin-200.woff2')", {
-        style: "normal",
-        weight: "200",
-    });
-    let jbmFont700 = new FontFace("JetBrains Mono", "url('public/fonts/jetbrains-mono-v13-latin-700.woff2')", {
-        style: "normal",
-        weight: "700",
-    });
-    let faFont = new FontFace("FontAwesome", "url(public/fonts/fontawesome-webfont-4.7.woff2)", {
-        style: "normal",
-        weight: "normal",
-    });
-    let docFonts: any = document.fonts; // work around ts typing issue
-    docFonts.add(jbmFontNormal);
-    docFonts.add(jbmFont200);
-    docFonts.add(jbmFont700);
-    docFonts.add(faFont);
-    jbmFontNormal.load();
-    jbmFont200.load();
-    jbmFont700.load();
-    faFont.load();
-}
-
 const DOW_STRS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 function getTodayStr(): string {
@@ -305,13 +260,13 @@ function getTodayStr(): string {
 }
 
 function getYesterdayStr(): string {
-    let d = new Date();
+    const d = new Date();
     d.setDate(d.getDate() - 1);
     return getDateStr(d);
 }
 
 function getDateStr(d: Date): string {
-    let yearStr = String(d.getFullYear());
+    const yearStr = String(d.getFullYear());
     let monthStr = String(d.getMonth() + 1);
     if (monthStr.length == 1) {
         monthStr = "0" + monthStr;
@@ -320,31 +275,50 @@ function getDateStr(d: Date): string {
     if (dayStr.length == 1) {
         dayStr = "0" + dayStr;
     }
-    let dowStr = DOW_STRS[d.getDay()];
+    const dowStr = DOW_STRS[d.getDay()];
     return dowStr + " " + yearStr + "-" + monthStr + "-" + dayStr;
 }
 
+function formatDuration(ms: number): string {
+    if (ms < 1000) {
+        return ms + "ms";
+    }
+    if (ms < 10000) {
+        return (ms / 1000).toFixed(2) + "s";
+    }
+    if (ms < 100000) {
+        return (ms / 1000).toFixed(1) + "s";
+    }
+    if (ms < 60 * 60 * 1000) {
+        let mins = Math.floor(ms / 60000);
+        let secs = Math.floor((ms % 60000) / 1000);
+        return mins + "m" + secs + "s";
+    }
+    let hours = Math.floor(ms / (60 * 60 * 1000));
+    let mins = Math.floor((ms % (60 * 60 * 1000)) / 60000);
+    return hours + "h" + mins + "m";
+}
+
 function getRemoteConnVal(r: RemoteType): number {
-    if (r.status == "connected") {
-        return 1;
+    switch (r.status) {
+        case "connected":
+            return 1;
+        case "connecting":
+            return 2;
+        case "disconnected":
+            return 3;
+        case "error":
+            return 4;
+        default:
+            return 5;
     }
-    if (r.status == "connecting") {
-        return 2;
-    }
-    if (r.status == "disconnected") {
-        return 3;
-    }
-    if (r.status == "error") {
-        return 4;
-    }
-    return 5;
 }
 
 function sortAndFilterRemotes(origRemotes: RemoteType[]): RemoteType[] {
-    let remotes = origRemotes.filter((r) => !r.archived);
+    const remotes = origRemotes.filter((r) => !r.archived);
     remotes.sort((a, b) => {
-        let connValA = getRemoteConnVal(a);
-        let connValB = getRemoteConnVal(b);
+        const connValA = getRemoteConnVal(a);
+        const connValB = getRemoteConnVal(b);
         if (connValA != connValB) {
             return connValA - connValB;
         }
@@ -381,7 +355,7 @@ function openLink(url: string): void {
     window.open(url, "_blank");
 }
 
-function getColorRGB(colorInput) {
+function getColorRGB(colorInput: string) {
     const tempElement = document.createElement("div");
     tempElement.style.color = colorInput;
     document.body.appendChild(tempElement);
@@ -390,29 +364,62 @@ function getColorRGB(colorInput) {
     return computedColorStyle;
 }
 
-function commandRtnHandler(prtn: Promise<CommandRtnType>, errorMessage: OV<string>) {
+function commandRtnHandler(prtn: Promise<CommandRtnType>, errorMessage: OV<string>, onSuccess?: () => void) {
     prtn.then((crtn) => {
         if (crtn.success) {
+            if (onSuccess) {
+                onSuccess();
+            }
             return;
         }
-        mobx.action(() => {
-            errorMessage.set(crtn.error);
-        })();
+        if (errorMessage != null) {
+            mobx.action(() => {
+                errorMessage.set(crtn.error);
+            })();
+        }
+    });
+}
+
+function getRemoteName(remote: RemoteType): string {
+    if (remote == null) {
+        return "";
+    }
+    const { remotealias, remotecanonicalname } = remote;
+    return remotealias ? `${remotealias} [${remotecanonicalname}]` : remotecanonicalname;
+}
+
+// clean empty string
+function ces(s: string) {
+    if (s == "") {
+        return null;
+    }
+    return s;
+}
+
+/**
+ * A wrapper function for running a promise and catching any errors
+ * @param f The promise to run
+ */
+function fireAndForget(f: () => Promise<any>) {
+    f().catch((e) => {
+        console.log("fireAndForget error", e);
     });
 }
 
 export {
+    handleNotOkResp,
     handleJsonFetchResponse,
+    base64ToString,
+    stringToBase64,
     base64ToArray,
     genMergeData,
     genMergeDataMap,
     genMergeSimpleData,
-    parseEnv0,
     boundInt,
     isModKeyPress,
     incObs,
     isBlank,
-    loadFonts,
+    isArray,
     getTodayStr,
     getYesterdayStr,
     getDateStr,
@@ -425,4 +432,8 @@ export {
     getColorRGB,
     commandRtnHandler,
     getRemoteConnVal,
+    getRemoteName,
+    ces,
+    fireAndForget,
+    formatDuration,
 };

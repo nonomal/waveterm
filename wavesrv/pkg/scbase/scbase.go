@@ -12,8 +12,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/user"
-	"path"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -36,15 +35,19 @@ const WaveLockFile = "waveterm.lock"
 const WaveDirName = ".waveterm"        // must match emain.ts
 const WaveDevDirName = ".waveterm-dev" // must match emain.ts
 const WaveAppPathVarName = "WAVETERM_APP_PATH"
-const WaveVersion = "v0.5.1"
 const WaveAuthKeyFileName = "waveterm.authkey"
-const MShellVersion = "v0.3.0"
-const DefaultMacOSShell = "/bin/bash"
+const WaveshellVersion = "v0.7.0" // must match base.WaveshellVersion
+
+// initialized by InitialzeWaveAuthKey (called by main-server)
+var WaveAuthKey string
 
 var SessionDirCache = make(map[string]string)
 var ScreenDirCache = make(map[string]string)
 var BaseLock = &sync.Mutex{}
+
+// these are set by the main-server using build-time variables
 var BuildTime = "-"
+var WaveVersion = "-"
 
 func IsDevMode() bool {
 	pdev := os.Getenv(WaveDevVarName)
@@ -61,92 +64,96 @@ func GetWaveHomeDir() string {
 		}
 		pdev := os.Getenv(WaveDevVarName)
 		if pdev != "" {
-			scHome = path.Join(homeVar, WaveDevDirName)
+			scHome = filepath.Join(homeVar, WaveDevDirName)
 		} else {
-			scHome = path.Join(homeVar, WaveDirName)
+			scHome = filepath.Join(homeVar, WaveDirName)
 		}
 
 	}
 	return scHome
 }
 
-func MShellBinaryDir() string {
+func WaveshellBinaryDir() string {
 	appPath := os.Getenv(WaveAppPathVarName)
 	if appPath == "" {
 		appPath = "."
 	}
-	return path.Join(appPath, "bin", "mshell")
+	return filepath.Join(appPath, "bin", "mshell")
 }
 
-func MShellBinaryPath(version string, goos string, goarch string) (string, error) {
+func WaveshellBinaryPath(version string, goos string, goarch string) (string, error) {
 	if !base.ValidGoArch(goos, goarch) {
 		return "", fmt.Errorf("invalid goos/goarch combination: %s/%s", goos, goarch)
 	}
-	binaryDir := MShellBinaryDir()
+	binaryDir := WaveshellBinaryDir()
 	versionStr := semver.MajorMinor(version)
 	if versionStr == "" {
-		return "", fmt.Errorf("invalid mshell version: %q", version)
+		return "", fmt.Errorf("invalid waveshell version: %q", version)
 	}
 	fileName := fmt.Sprintf("mshell-%s-%s.%s", versionStr, goos, goarch)
-	fullFileName := path.Join(binaryDir, fileName)
+	fullFileName := filepath.Join(binaryDir, fileName)
 	return fullFileName, nil
 }
 
-func LocalMShellBinaryPath() (string, error) {
-	return MShellBinaryPath(MShellVersion, runtime.GOOS, runtime.GOARCH)
+func LocalWaveshellBinaryPath() (string, error) {
+	return WaveshellBinaryPath(WaveshellVersion, runtime.GOOS, runtime.GOARCH)
 }
 
-func MShellBinaryReader(version string, goos string, goarch string) (io.ReadCloser, error) {
-	mshellPath, err := MShellBinaryPath(version, goos, goarch)
+func WaveshellBinaryReader(version string, goos string, goarch string) (io.ReadCloser, error) {
+	waveshellPath, err := WaveshellBinaryPath(version, goos, goarch)
 	if err != nil {
 		return nil, err
 	}
-	fd, err := os.Open(mshellPath)
+	fd, err := os.Open(waveshellPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open mshell binary %q: %v", mshellPath, err)
+		return nil, fmt.Errorf("cannot open waveshell binary %q: %v", waveshellPath, err)
 	}
 	return fd, nil
 }
 
-func createWaveAuthKeyFile(fileName string) (string, error) {
+// also sets WaveAuthKey
+func createWaveAuthKeyFile(fileName string) error {
 	fd, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer fd.Close()
 	keyStr := GenWaveUUID()
 	_, err = fd.Write([]byte(keyStr))
 	if err != nil {
-		return "", err
+		return err
 	}
-	return keyStr, nil
+	WaveAuthKey = keyStr
+	return nil
 }
 
-func ReadWaveAuthKey() (string, error) {
+// sets WaveAuthKey
+func InitializeWaveAuthKey() error {
 	homeDir := GetWaveHomeDir()
 	err := ensureDir(homeDir)
 	if err != nil {
-		return "", fmt.Errorf("cannot find/create WAVETERM_HOME directory %q", homeDir)
+		return fmt.Errorf("cannot find/create WAVETERM_HOME directory %q", homeDir)
 	}
-	fileName := path.Join(homeDir, WaveAuthKeyFileName)
+	fileName := filepath.Join(homeDir, WaveAuthKeyFileName)
 	fd, err := os.Open(fileName)
 	if err != nil && errors.Is(err, fs.ErrNotExist) {
 		return createWaveAuthKeyFile(fileName)
 	}
 	if err != nil {
-		return "", fmt.Errorf("error opening wave authkey:%s: %v", fileName, err)
+		return fmt.Errorf("error opening wave authkey:%s: %v", fileName, err)
 	}
 	defer fd.Close()
 	buf, err := io.ReadAll(fd)
 	if err != nil {
-		return "", fmt.Errorf("error reading wave authkey:%s: %v", fileName, err)
+		return fmt.Errorf("error reading wave authkey:%s: %v", fileName, err)
 	}
 	keyStr := string(buf)
 	_, err = uuid.Parse(keyStr)
 	if err != nil {
-		return "", fmt.Errorf("invalid authkey:%s format: %v", fileName, err)
+		return fmt.Errorf("invalid authkey:%s format: %v", fileName, err)
 	}
-	return keyStr, nil
+	WaveAuthKey = keyStr
+	return nil
 }
 
 func AcquireWaveLock() (*os.File, error) {
@@ -155,7 +162,7 @@ func AcquireWaveLock() (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot find/create WAVETERM_HOME directory %q", homeDir)
 	}
-	lockFileName := path.Join(homeDir, WaveLockFile)
+	lockFileName := filepath.Join(homeDir, WaveLockFile)
 	log.Printf("[base] acquiring lock on %s\n", lockFileName)
 	fd, err := os.OpenFile(lockFileName, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
@@ -181,7 +188,7 @@ func EnsureSessionDir(sessionId string) (string, error) {
 		return sdir, nil
 	}
 	scHome := GetWaveHomeDir()
-	sdir = path.Join(scHome, SessionsDirBaseName, sessionId)
+	sdir = filepath.Join(scHome, SessionsDirBaseName, sessionId)
 	err := ensureDir(sdir)
 	if err != nil {
 		return "", err
@@ -195,7 +202,7 @@ func EnsureSessionDir(sessionId string) (string, error) {
 // deprecated (v0.1.8)
 func GetSessionsDir() string {
 	waveHome := GetWaveHomeDir()
-	sdir := path.Join(waveHome, SessionsDirBaseName)
+	sdir := filepath.Join(waveHome, SessionsDirBaseName)
 	return sdir
 }
 
@@ -210,7 +217,7 @@ func EnsureScreenDir(screenId string) (string, error) {
 		return sdir, nil
 	}
 	scHome := GetWaveHomeDir()
-	sdir = path.Join(scHome, ScreensDirBaseName, screenId)
+	sdir = filepath.Join(scHome, ScreensDirBaseName, screenId)
 	err := ensureDir(sdir)
 	if err != nil {
 		return "", err
@@ -223,8 +230,53 @@ func EnsureScreenDir(screenId string) (string, error) {
 
 func GetScreensDir() string {
 	waveHome := GetWaveHomeDir()
-	sdir := path.Join(waveHome, ScreensDirBaseName)
+	sdir := filepath.Join(waveHome, ScreensDirBaseName)
 	return sdir
+}
+
+func EnsureConfigDirs() (string, error) {
+	scHome := GetWaveHomeDir()
+	configDir := filepath.Join(scHome, "config")
+	err := ensureDir(configDir)
+	if err != nil {
+		return "", err
+	}
+	keybindingsFile := filepath.Join(configDir, "keybindings.json")
+	keybindingsFileObj, err := ensureFile(keybindingsFile)
+	if err != nil {
+		return "", err
+	}
+	if keybindingsFileObj != nil {
+		keybindingsFileObj.WriteString("[]\n")
+		keybindingsFileObj.Close()
+	}
+	terminalThemesDir := filepath.Join(configDir, "terminal-themes")
+	err = ensureDir(terminalThemesDir)
+	if err != nil {
+		return "", err
+	}
+	return configDir, nil
+}
+
+func ensureFile(fileName string) (*os.File, error) {
+	info, err := os.Stat(fileName)
+	var myFile *os.File
+	if errors.Is(err, fs.ErrNotExist) {
+		myFile, err = os.Create(fileName)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("[wave] created file %q\n", fileName)
+		info, err = myFile.Stat()
+	}
+	if err != nil {
+		return myFile, err
+	}
+	if info.IsDir() {
+		return myFile, fmt.Errorf("'%s' must be a file", fileName)
+	}
+	return myFile, nil
+
 }
 
 func ensureDir(dirName string) error {
@@ -353,11 +405,11 @@ func ClientArch() string {
 	return fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
 }
 
-var releaseRegex = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+var releaseRegex = regexp.MustCompile(`^(\d+\.\d+\.\d+)`)
 var osReleaseOnce = &sync.Once{}
 var osRelease string
 
-func macOSRelease() string {
+func unameKernelRelease() string {
 	ctx, cancelFn := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelFn()
 	out, err := exec.CommandContext(ctx, "uname", "-r").CombinedOutput()
@@ -366,43 +418,46 @@ func macOSRelease() string {
 		return "-"
 	}
 	releaseStr := strings.TrimSpace(string(out))
-	if !releaseRegex.MatchString(releaseStr) {
+	m := releaseRegex.FindStringSubmatch(releaseStr)
+	if m == nil || len(m) < 2 {
 		log.Printf("invalid uname -r output: [%s]\n", releaseStr)
 		return "-"
 	}
-	return releaseStr
+	return m[1]
 }
 
-func MacOSRelease() string {
+func UnameKernelRelease() string {
 	osReleaseOnce.Do(func() {
-		osRelease = macOSRelease()
+		osRelease = unameKernelRelease()
 	})
 	return osRelease
 }
 
-var userShellRegexp = regexp.MustCompile(`^UserShell: (.*)$`)
+var osLangOnce = &sync.Once{}
+var osLang string
 
-// dscl . -read /User/[username] UserShell
-// defaults to /bin/bash
-func MacUserShell() string {
-	osUser, err := user.Current()
-	if err != nil {
-		log.Printf("error getting current user: %v\n", err)
-		return DefaultMacOSShell
-	}
+func determineLang() string {
 	ctx, cancelFn := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelFn()
-	userStr := "/Users/" + osUser.Name
-	out, err := exec.CommandContext(ctx, "dscl", ".", "-read", userStr, "UserShell").CombinedOutput()
-	if err != nil {
-		log.Printf("error executing macos user shell lookup: %v %q\n", err, string(out))
-		return DefaultMacOSShell
+	if runtime.GOOS == "darwin" {
+		out, err := exec.CommandContext(ctx, "defaults", "read", "-g", "AppleLocale").CombinedOutput()
+		if err != nil {
+			log.Printf("error executing 'defaults read -g AppleLocale': %v\n", err)
+			return ""
+		}
+		strOut := string(out)
+		truncOut := strings.Split(strOut, "@")[0]
+		return strings.TrimSpace(truncOut) + ".UTF-8"
+	} else {
+		// this is specifically to get the wavesrv LANG so waveshell
+		// on a remote uses the same LANG
+		return os.Getenv("LANG")
 	}
-	outStr := strings.TrimSpace(string(out))
-	m := userShellRegexp.FindStringSubmatch(outStr)
-	if m == nil {
-		log.Printf("error in format of dscl output: %q\n", outStr)
-		return DefaultMacOSShell
-	}
-	return m[1]
+}
+
+func DetermineLang() string {
+	osLangOnce.Do(func() {
+		osLang = determineLang()
+	})
+	return osLang
 }

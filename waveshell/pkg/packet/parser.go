@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/wavetermdev/waveterm/waveshell/pkg/wlog"
 )
 
 type PacketParser struct {
@@ -144,22 +146,24 @@ func (p *PacketParser) getRpcEntry(reqId string) *RpcEntry {
 	return entry
 }
 
+// returns true if sent to an RPC channel.  false if not (which then allows the packet to be sent to MainCh)
+// if GetResponseId() returns "", then this will return false
 func (p *PacketParser) trySendRpcResponse(pk PacketType) bool {
 	respPk, ok := pk.(RpcResponsePacketType)
 	if !ok {
 		return false
 	}
+	respId := respPk.GetResponseId()
+	if respId == "" {
+		return false
+	}
 	p.Lock.Lock()
-	defer p.Lock.Unlock()
-	entry := p.RpcMap[respPk.GetResponseId()]
+	entry := p.RpcMap[respId]
+	p.Lock.Unlock()
 	if entry == nil {
 		return false
 	}
-	// nonblocking send
-	select {
-	case entry.RespCh <- respPk:
-	default:
-	}
+	entry.RespCh <- respPk
 	return true
 }
 
@@ -177,13 +181,22 @@ func (p *PacketParser) SetErr(err error) {
 	}
 }
 
-func MakePacketParser(input io.Reader, rpcHandler bool) *PacketParser {
+type PacketParserOpts struct {
+	RpcHandler       bool
+	IgnoreUntilValid bool
+}
+
+func MakePacketParser(input io.Reader, opts *PacketParserOpts) *PacketParser {
+	if opts == nil {
+		opts = &PacketParserOpts{}
+	}
 	parser := &PacketParser{
 		Lock:       &sync.Mutex{},
 		MainCh:     make(chan PacketType),
 		RpcMap:     make(map[string]*RpcEntry),
-		RpcHandler: rpcHandler,
+		RpcHandler: opts.RpcHandler,
 	}
+	ignoreUntilValid := opts.IgnoreUntilValid
 	bufReader := bufio.NewReader(input)
 	go func() {
 		defer func() {
@@ -204,11 +217,15 @@ func MakePacketParser(input io.Reader, rpcHandler bool) *PacketParser {
 			// ##[len][json]\n
 			// ##14{"hello":true}\n
 			// ##N{...}
+			hasPrefix := strings.HasPrefix(line, "##")
 			bracePos := strings.Index(line, "{")
-			if !strings.HasPrefix(line, "##") || bracePos == -1 {
-				parser.MainCh <- MakeRawPacket(line[:len(line)-1])
+			if !hasPrefix || bracePos == -1 {
+				if !ignoreUntilValid {
+					parser.MainCh <- MakeRawPacket(line[:len(line)-1])
+				}
 				continue
 			}
+			ignoreUntilValid = false
 			packetLen := -1
 			if line[2:bracePos] != "N" {
 				packetLen, err = strconv.Atoi(line[2:bracePos])
@@ -226,6 +243,11 @@ func MakePacketParser(input io.Reader, rpcHandler bool) *PacketParser {
 				return
 			}
 			if pk.GetType() == PingPacketStr {
+				continue
+			}
+			if pk.GetType() == LogPacketStr {
+				logPk := pk.(*LogPacketType)
+				wlog.LogLogEntry(logPk.Entry)
 				continue
 			}
 			if parser.RpcHandler {

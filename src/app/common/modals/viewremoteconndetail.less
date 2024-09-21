@@ -1,0 +1,104 @@
+.rconndetail-modal {
+    .wave-modal-content {
+        display: flex;
+        padding-bottom: 0px;
+        flex-direction: column;
+        align-items: center;
+        flex-shrink: 0;
+        width: auto;
+        max-width: 80vw;
+        max-height: 90vh;
+
+        .wave-modal-body {
+            display: flex;
+            padding: 20px;
+            align-items: flex-start;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-self: stretch;
+            overflow-y: scroll;
+
+            .name-header-actions-wrapper {
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 12px;
+
+                .name-wrapper {
+                    display: flex;
+                    flex-direction: row;
+                }
+
+                .rconndetail-name {
+                    color: var(--app-text-primary-color);
+                    font-size: 15px;
+                    font-weight: 500;
+                    line-height: 20px;
+                }
+
+                .header-actions {
+                    display: flex;
+                    justify-content: flex-end;
+                    align-items: flex-start;
+
+                    .wave-button {
+                        padding: 4px 15px;
+                        margin-right: 8px;
+                    }
+                }
+            }
+
+            .remote-detail {
+                width: 100%;
+                padding-top: 16px;
+
+                .settings-field {
+                    display: flex;
+                    flex-direction: row;
+                    align-items: center;
+
+                    .settings-label {
+                        font-weight: bold;
+                        width: 12em;
+                        display: flex;
+                        flex-direction: row;
+                        align-items: center;
+                    }
+
+                    .settings-input {
+                        display: flex;
+                        flex-direction: row;
+                        align-items: center;
+                        color: var(--app-text-color);
+                    }
+                }
+
+                .status {
+                    display: flex;
+                    height: 30px;
+                    padding: 3px 8px;
+                    align-items: center;
+                    gap: 8px;
+                    align-self: stretch;
+                    border-radius: 6px;
+                    background: rgba(241, 246, 243, 0.08);
+                }
+
+                .terminal-wrapper {
+                    margin-top: 5px;
+                    overflow-x: auto;
+                    overflow-y: hidden;
+                    border: 1px solid var(--app-border-color);
+                    border-radius: 6px;
+                    padding: 6px 10px;
+
+                    .terminal-connectelem {
+                        height: 163px !important; // Needed to override plugin height
+                    }
+                }
+            }
+        }
+    }
+}

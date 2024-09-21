@@ -4,15 +4,13 @@
 import * as React from "react";
 import * as mobx from "mobx";
 import * as mobxReact from "mobx-react";
-import * as T from "../../types/types";
 import { debounce } from "throttle-debounce";
 import { boundMethod } from "autobind-decorator";
 import { PacketDataBuffer } from "../core/ptydata";
-import { Markdown } from "../../app/common/common";
+import { Markdown } from "@/elements";
+import { GlobalModel } from "@/models/global";
 
 import "./openai.less";
-
-type OV<V> = mobx.IObservableValue<V>;
 
 type OpenAIOutputType = {
     model: string;
@@ -22,17 +20,18 @@ type OpenAIOutputType = {
 };
 
 class OpenAIRendererModel {
-    context: T.RendererContext;
-    opts: T.RendererOpts;
+    context: RendererContext;
+    opts: RendererOpts;
     isDone: OV<boolean>;
-    api: T.RendererModelContainerApi;
+    api: RendererModelContainerApi;
     savedHeight: number;
     loading: OV<boolean>;
     loadError: OV<string> = mobx.observable.box(null, { name: "renderer-loadError" });
+    chatError: OV<string> = mobx.observable.box(null, { name: "renderer-chatError" });
     updateHeight_debounced: (newHeight: number) => void;
-    ptyDataSource: (termContext: T.TermContextUnion) => Promise<T.PtyDataType>;
+    ptyDataSource: (termContext: TermContextUnion) => Promise<PtyDataType>;
     packetData: PacketDataBuffer;
-    rawCmd: T.WebCmd;
+    rawCmd: WebCmd;
     output: OV<OpenAIOutputType>;
     version: OV<number>;
 
@@ -43,7 +42,7 @@ class OpenAIRendererModel {
         this.version = mobx.observable.box(0);
     }
 
-    initialize(params: T.RendererModelInitializeParams): void {
+    initialize(params: RendererModelInitializeParams): void {
         this.loading = mobx.observable.box(true, { name: "renderer-loading" });
         this.isDone = mobx.observable.box(params.isDone, { name: "renderer-isDone" });
         this.context = params.context;
@@ -57,14 +56,14 @@ class OpenAIRendererModel {
 
     @boundMethod
     packetCallback(packetAny: any) {
-        let packet: T.OpenAIPacketType = packetAny;
+        let packet: OpenAIPacketType = packetAny;
         if (packet == null) {
             return;
         }
         // console.log("got packet", packet);
         if (packet.error != null) {
             mobx.action(() => {
-                this.loadError.set(packet.error);
+                this.chatError.set(packet.error);
                 this.version.set(this.version.get() + 1);
             })();
             return;
@@ -106,7 +105,7 @@ class OpenAIRendererModel {
         return;
     }
 
-    updateOpts(update: T.RendererOptsUpdate): void {
+    updateOpts(update: RendererOptsUpdate): void {
         Object.assign(this.opts, update);
     }
 
@@ -131,6 +130,7 @@ class OpenAIRendererModel {
         mobx.action(() => {
             this.loading.set(true);
             this.loadError.set(null);
+            this.chatError.set(null);
         })();
         let rtnp = this.ptyDataSource(this.context);
         if (rtnp == null) {
@@ -160,7 +160,7 @@ class OpenAIRendererModel {
 
 @mobxReact.observer
 class OpenAIRenderer extends React.Component<{ model: OpenAIRendererModel }> {
-    renderPrompt(cmd: T.WebCmd) {
+    renderPrompt(cmd: WebCmd) {
         let cmdStr = cmd.cmdstr.trim();
         if (cmdStr.startsWith("/openai")) {
             let spaceIdx = cmdStr.indexOf(" ");
@@ -186,15 +186,14 @@ class OpenAIRenderer extends React.Component<{ model: OpenAIRendererModel }> {
         );
     }
 
-    renderOutput(cmd: T.WebCmd) {
-        let output = this.props.model.output.get();
-        let message = "";
-        if (output != null) {
-            message = output.message ?? "";
-        }
+    renderOutput() {
         let model = this.props.model;
+        let output = model.output.get();
+        if (output == null || output.message == null || output.message == "") {
+            return null;
+        }
+        let message = output.message;
         let opts = model.opts;
-        let maxWidth = opts.maxSize.width;
         let minWidth = opts.maxSize.width;
         if (minWidth > 1000) {
             minWidth = 1000;
@@ -204,12 +203,9 @@ class OpenAIRenderer extends React.Component<{ model: OpenAIRendererModel }> {
                 <div className="openai-role openai-role-assistant">[assistant]</div>
                 <div className="openai-content-assistant">
                     <div
-                        className="scroller"
                         style={{
                             maxHeight: opts.maxSize.height,
-                            minWidth: minWidth,
-                            width: "min-content",
-                            maxWidth: maxWidth,
+                            paddingRight: 5,
                         }}
                     >
                         <Markdown text={message} style={{ maxHeight: opts.maxSize.height }} />
@@ -219,12 +215,38 @@ class OpenAIRenderer extends React.Component<{ model: OpenAIRendererModel }> {
         );
     }
 
+    renderChatError() {
+        let model = this.props.model;
+        let chatError = model.chatError.get();
+        if (chatError == null) {
+            return null;
+        }
+        return (
+            <div className="openai-message">
+                <div className="openai-role openai-role-error">[error]</div>
+                <div className="openai-content-error">{chatError}</div>
+            </div>
+        );
+    }
+
     render() {
         let model: OpenAIRendererModel = this.props.model;
         let cmd = model.rawCmd;
         let styleVal: Record<string, any> = null;
         if (model.loading.get() && model.savedHeight >= 0 && model.isDone) {
-            styleVal = { height: model.savedHeight };
+            styleVal = {
+                height: model.savedHeight,
+                maxHeight: model.opts.maxSize.height,
+            };
+        } else {
+            let maxWidth = model.opts.maxSize.width;
+            if (maxWidth > 1000) {
+                maxWidth = 1000;
+            }
+            styleVal = {
+                maxWidth: maxWidth,
+                maxHeight: model.opts.maxSize.height,
+            };
         }
         let version = model.version.get();
         let loadError = model.loadError.get();
@@ -239,7 +261,8 @@ class OpenAIRenderer extends React.Component<{ model: OpenAIRendererModel }> {
         return (
             <div className="openai-renderer" style={styleVal}>
                 {this.renderPrompt(cmd)}
-                {this.renderOutput(cmd)}
+                {this.renderOutput()}
+                {this.renderChatError()}
             </div>
         );
     }

@@ -3,19 +3,15 @@
 
 import * as mobx from "mobx";
 import { Terminal } from "xterm";
+import type { ITheme } from "xterm";
 import { sprintf } from "sprintf-js";
 import { boundMethod } from "autobind-decorator";
-import { windowWidthToCols, windowHeightToRows } from "../../util/textmeasure";
-import { boundInt } from "../../util/util";
-import type {
-    TermContextUnion,
-    TermOptsType,
-    TermWinSize,
-    RendererContext,
-    WindowSize,
-    PtyDataType,
-} from "../../types/types";
-import { getTheme } from "../../app/common/themes/themes";
+import { windowWidthToCols, windowHeightToRows } from "@/util/textmeasure";
+import { boundInt } from "@/util/util";
+import { GlobalModel } from "@/models";
+import { WebglAddon } from "xterm-addon-webgl";
+import { WebLinksAddon } from "xterm-addon-web-links";
+import { SerializeAddon } from "xterm-addon-serialize";
 
 type DataUpdate = {
     data: Uint8Array;
@@ -24,6 +20,20 @@ type DataUpdate = {
 
 const MinTermCols = 10;
 const MaxTermCols = 1024;
+
+// detect webgl support
+function detectWebGLSupport(): boolean {
+    try {
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("webgl");
+        return !!ctx;
+    } catch (e) {
+        return false;
+    }
+}
+
+const WebGLSupported = detectWebGLSupport();
+let loggedWebGL = false;
 
 type TermWrapOpts = {
     termContext: TermContextUnion;
@@ -36,9 +46,38 @@ type TermWrapOpts = {
     isRunning: boolean;
     customKeyHandler?: (event: any, termWrap: TermWrap) => boolean;
     fontSize: number;
+    fontFamily: string;
     ptyDataSource: (termContext: TermContextUnion) => Promise<PtyDataType>;
     onUpdateContentHeight: (termContext: RendererContext, height: number) => void;
 };
+
+function getThemeFromCSSVars(el: Element): ITheme {
+    const theme: ITheme = {};
+    const rootStyle = getComputedStyle(el);
+    theme.foreground = rootStyle.getPropertyValue("--term-foreground");
+    theme.background = rootStyle.getPropertyValue("--term-background");
+    theme.black = rootStyle.getPropertyValue("--term-black");
+    theme.red = rootStyle.getPropertyValue("--term-red");
+    theme.green = rootStyle.getPropertyValue("--term-green");
+    theme.yellow = rootStyle.getPropertyValue("--term-yellow");
+    theme.blue = rootStyle.getPropertyValue("--term-blue");
+    theme.magenta = rootStyle.getPropertyValue("--term-magenta");
+    theme.cyan = rootStyle.getPropertyValue("--term-cyan");
+    theme.white = rootStyle.getPropertyValue("--term-white");
+    theme.brightBlack = rootStyle.getPropertyValue("--term-bright-black");
+    theme.brightRed = rootStyle.getPropertyValue("--term-bright-red");
+    theme.brightGreen = rootStyle.getPropertyValue("--term-bright-green");
+    theme.brightYellow = rootStyle.getPropertyValue("--term-bright-yellow");
+    theme.brightBlue = rootStyle.getPropertyValue("--term-bright-blue");
+    theme.brightMagenta = rootStyle.getPropertyValue("--term-bright-magenta");
+    theme.brightCyan = rootStyle.getPropertyValue("--term-bright-cyan");
+    theme.brightWhite = rootStyle.getPropertyValue("--term-bright-white");
+    theme.selectionBackground = rootStyle.getPropertyValue("--term-selection-background");
+    theme.selectionInactiveBackground = rootStyle.getPropertyValue("--term-selection-background");
+    theme.cursor = rootStyle.getPropertyValue("--term-selection-background");
+    theme.cursorAccent = rootStyle.getPropertyValue("--term-cursor-accent");
+    return theme;
+}
 
 // cmd-instance
 class TermWrap {
@@ -58,10 +97,12 @@ class TermWrap {
     focusHandler: (focus: boolean) => void;
     isRunning: boolean;
     fontSize: number;
+    fontFamily: string;
     onUpdateContentHeight: (termContext: RendererContext, height: number) => void;
     ptyDataSource: (termContext: TermContextUnion) => Promise<PtyDataType>;
     initializing: boolean;
     dataHandler?: (data: string, termWrap: TermWrap) => void;
+    serializeAddon: SerializeAddon;
 
     constructor(elem: Element, opts: TermWrapOpts) {
         opts = opts ?? ({} as any);
@@ -72,6 +113,7 @@ class TermWrap {
         this.focusHandler = opts.focusHandler;
         this.isRunning = opts.isRunning;
         this.fontSize = opts.fontSize;
+        this.fontFamily = opts.fontFamily;
         this.ptyDataSource = opts.ptyDataSource;
         this.onUpdateContentHeight = opts.onUpdateContentHeight;
         this.initializing = true;
@@ -88,21 +130,54 @@ class TermWrap {
             let cols = windowWidthToCols(opts.winSize.width, opts.fontSize);
             this.termSize = { rows: opts.termOpts.rows, cols: cols };
         }
-        const { terminal } = getTheme();
+        let theme = getThemeFromCSSVars(this.connectedElem);
         this.terminal = new Terminal({
             rows: this.termSize.rows,
             cols: this.termSize.cols,
             fontSize: opts.fontSize,
-            fontFamily: "JetBrains Mono",
-            theme: { foreground: terminal.foreground, background: terminal.background },
+            fontFamily: opts.fontFamily,
+            drawBoldTextInBrightColors: false,
+            fontWeight: "normal",
+            fontWeightBold: "bold",
+            theme: theme,
         });
+        this.terminal.loadAddon(
+            new WebLinksAddon((e, uri) => {
+                e.preventDefault();
+                switch (GlobalModel.platform) {
+                    case "darwin":
+                        if (e.metaKey) {
+                            GlobalModel.openExternalLink(uri);
+                        }
+                        break;
+                    default:
+                        if (e.ctrlKey) {
+                            GlobalModel.openExternalLink(uri);
+                        }
+                        break;
+                }
+            })
+        );
+        if (WebGLSupported && GlobalModel.clientData.get().clientopts?.webgl) {
+            const webglAddon = new WebglAddon();
+            webglAddon.onContextLoss(() => {
+                webglAddon.dispose();
+            });
+            this.terminal.loadAddon(webglAddon);
+            if (!loggedWebGL) {
+                console.log("loaded webgl!");
+                loggedWebGL = true;
+            }
+        }
+        this.serializeAddon = new SerializeAddon();
+        this.terminal.loadAddon(this.serializeAddon);
         this.terminal._core._inputHandler._parser.setErrorHandler((state) => {
             this.numParseErrors++;
             return state;
         });
         this.terminal.open(elem);
         if (opts.keyHandler != null) {
-            this.terminal.onKey((e) => opts.keyHandler(e, this));
+            //this.terminal.onKey((e) => opts.keyHandler(e, this));
         }
         if (opts.dataHandler != null) {
             this.dataHandler = opts.dataHandler;
@@ -174,7 +249,7 @@ class TermWrap {
             return;
         }
         this.terminal.focus();
-        setTimeout(() => this.terminal._core.viewport.syncScrollArea(true), 0);
+        setTimeout(() => this.terminal?._core?.viewport?.syncScrollArea(true), 0);
     }
 
     disconnectElem() {
@@ -208,6 +283,39 @@ class TermWrap {
             }
         }
         return usedRows;
+    }
+
+    // gets the text output of the terminal (respects line wrapping)
+    // if fullOutput is true, returns all output, otherwise only the visible output
+    getOutput(fullOutput: boolean): string {
+        let activeBuf = this.terminal?.buffer?.active;
+        if (activeBuf == null) {
+            return null;
+        }
+        const totalLines = activeBuf.length;
+        let output = [];
+        let emptyStart = -1;
+        let startLine = fullOutput ? 0 : activeBuf.viewportY;
+        for (let i = startLine; i < totalLines; i++) {
+            const line = activeBuf.getLine(i);
+            const lineStr = line?.translateToString(true) ?? "";
+            if (lineStr == "") {
+                if (emptyStart == -1) {
+                    emptyStart = output.length;
+                }
+            } else {
+                emptyStart = -1;
+            }
+            if (line?.isWrapped) {
+                output[output.length - 1] += lineStr;
+            } else {
+                output.push(lineStr);
+            }
+        }
+        if (emptyStart != -1) {
+            output = output.slice(0, emptyStart);
+        }
+        return output.join("\n");
     }
 
     updateUsedRows(forceFull: boolean, reason: string) {
@@ -266,7 +374,7 @@ class TermWrap {
 
     resizeWindow(size: WindowSize): void {
         let cols = windowWidthToCols(size.width, this.fontSize);
-        let rows = windowHeightToRows(size.height, this.fontSize);
+        let rows = windowHeightToRows(GlobalModel.lineHeightEnv, size.height);
         this.resize({ rows, cols });
     }
 

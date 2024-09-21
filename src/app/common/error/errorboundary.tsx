@@ -1,6 +1,5 @@
 import React, { Component, ReactNode } from "react";
-import { RendererContext } from "../../../types/types";
-import cn from "classnames";
+import { clsx } from "clsx";
 
 interface ErrorBoundaryState {
     hasError: boolean;
@@ -44,7 +43,7 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
         const { plugin } = this.props;
 
         return (
-            <div className={cn("load-error-text", { "view-error": !plugin })}>
+            <div className={clsx("load-error-text", { "view-error": !plugin })}>
                 <div>{`${error?.message}`}</div>
                 {plugin && <div>An error occurred in the {plugin} plugin</div>}
             </div>

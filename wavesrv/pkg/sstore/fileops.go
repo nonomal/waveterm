@@ -12,10 +12,13 @@ import (
 	"log"
 	"os"
 	"path"
+	"time"
 
-	"github.com/wavetermdev/waveterm/waveshell/pkg/cirfile"
-	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbase"
 	"github.com/google/uuid"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/cirfile"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/shexec"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbase"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbus"
 )
 
 func CreateCmdPtyFile(ctx context.Context, screenId string, lineId string, maxSize int64) error {
@@ -38,7 +41,28 @@ func StatCmdPtyFile(ctx context.Context, screenId string, lineId string) (*cirfi
 	return cirfile.StatCirFile(ctx, ptyOutFileName)
 }
 
-func AppendToCmdPtyBlob(ctx context.Context, screenId string, lineId string, data []byte, pos int64) (*PtyDataUpdate, error) {
+func ClearCmdPtyFile(ctx context.Context, screenId string, lineId string) error {
+	ptyOutFileName, err := scbase.PtyOutFile(screenId, lineId)
+	if err != nil {
+		return err
+	}
+	stat, err := cirfile.StatCirFile(ctx, ptyOutFileName)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	os.Remove(ptyOutFileName) // ignore error
+	var maxSize int64 = shexec.DefaultMaxPtySize
+	if stat != nil {
+		maxSize = stat.MaxSize
+	}
+	err = CreateCmdPtyFile(ctx, screenId, lineId, maxSize)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func AppendToCmdPtyBlob(ctx context.Context, screenId string, lineId string, data []byte, pos int64) (*scbus.PtyDataUpdatePacketType, error) {
 	if screenId == "" {
 		return nil, fmt.Errorf("cannot append to PtyBlob, screenid is not set")
 	}
@@ -59,13 +83,13 @@ func AppendToCmdPtyBlob(ctx context.Context, screenId string, lineId string, dat
 		return nil, err
 	}
 	data64 := base64.StdEncoding.EncodeToString(data)
-	update := &PtyDataUpdate{
+	update := scbus.MakePtyDataUpdate(&scbus.PtyDataUpdate{
 		ScreenId:   screenId,
 		LineId:     lineId,
 		PtyPos:     pos,
 		PtyData64:  data64,
 		PtyDataLen: int64(len(data)),
-	}
+	})
 	err = MaybeInsertPtyPosUpdate(ctx, screenId, lineId)
 	if err != nil {
 		// just log
@@ -177,11 +201,28 @@ func DeletePtyOutFile(ctx context.Context, screenId string, lineId string) error
 	return err
 }
 
+func GoDeleteScreenDirs(screenIds ...string) {
+	go func() {
+		for _, screenId := range screenIds {
+			deleteScreenDirMakeCtx(screenId)
+		}
+	}()
+}
+
+func deleteScreenDirMakeCtx(screenId string) {
+	ctx, cancelFn := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelFn()
+	err := DeleteScreenDir(ctx, screenId)
+	if err != nil {
+		log.Printf("error deleting screendir %s: %v\n", screenId, err)
+	}
+}
+
 func DeleteScreenDir(ctx context.Context, screenId string) error {
 	screenDir, err := scbase.EnsureScreenDir(screenId)
 	if err != nil {
 		return fmt.Errorf("error getting screendir: %w", err)
 	}
-	log.Printf("remove-all %s\n", screenDir)
+	log.Printf("delete screen dir, remove-all %s\n", screenDir)
 	return os.RemoveAll(screenDir)
 }

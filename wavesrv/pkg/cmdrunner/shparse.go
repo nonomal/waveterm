@@ -9,10 +9,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/wavetermdev/waveterm/waveshell/pkg/shexec"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/shellapi"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/simpleexpand"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/utilfn"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/scpacket"
-	"github.com/wavetermdev/waveterm/wavesrv/pkg/utilfn"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -35,6 +35,8 @@ var BareMetaCmds = []BareMetaCmdDecl{
 	{"markdownview", "markdownview"},
 	{"mdview", "markdownview"},
 	{"csvview", "csvview"},
+	{"pdfview", "pdfview"},
+	{"mediaview", "mediaview"},
 }
 
 const (
@@ -141,6 +143,12 @@ func onlyRawArgs(metaCmd string, metaSubCmd string) bool {
 	return CmdParseOverrides[metaCmd] == CmdParseTypeRaw
 }
 
+var waveValidIdentifierRe = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+func isValidWaveParamName(name string) bool {
+	return waveValidIdentifierRe.MatchString(name)
+}
+
 func setBracketArgs(argMap map[string]string, bracketStr string) error {
 	bracketStr = strings.TrimSpace(bracketStr)
 	if bracketStr == "" {
@@ -160,7 +168,7 @@ func setBracketArgs(argMap map[string]string, bracketStr string) error {
 			varName = litStr[0:eqIdx]
 			varVal = litStr[eqIdx+1:]
 		}
-		if !shexec.IsValidBashIdentifier(varName) {
+		if !isValidWaveParamName(varName) {
 			wordErr = fmt.Errorf("invalid identifier %s in bracket args", utilfn.ShellQuote(varName, true, 20))
 			return false
 		}
@@ -183,14 +191,31 @@ var literalRtnStateCommands = []string{
 	".",
 	"source",
 	"unset",
+	"unsetopt",
 	"cd",
 	"alias",
 	"unalias",
 	"deactivate",
 	"eval",
 	"asdf",
+	"sdk",
 	"nvm",
 	"virtualenv",
+	"builtin",
+	"typeset",
+	"declare",
+	"float",
+	"functions",
+	"integer",
+	"local",
+	"readonly",
+	"unfunction",
+	"shopt",
+	"enable",
+	"disable",
+	"function",
+	"zmodload",
+	"module",
 }
 
 func getCallExprLitArg(callExpr *syntax.CallExpr, argNum int) string {
@@ -208,30 +233,127 @@ func getCallExprLitArg(callExpr *syntax.CallExpr, argNum int) string {
 	return lit.Value
 }
 
+func isRtnStateCmd(cmd syntax.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if _, ok := cmd.(*syntax.FuncDecl); ok {
+		return true
+	}
+	if blockExpr, ok := cmd.(*syntax.Block); ok {
+		for _, stmt := range blockExpr.Stmts {
+			if isRtnStateCmd(stmt.Cmd) {
+				return true
+			}
+		}
+		return false
+	}
+	if binExpr, ok := cmd.(*syntax.BinaryCmd); ok {
+		if isRtnStateCmd(binExpr.X.Cmd) || isRtnStateCmd(binExpr.Y.Cmd) {
+			return true
+		}
+	} else if callExpr, ok := cmd.(*syntax.CallExpr); ok {
+		if len(callExpr.Assigns) > 0 && len(callExpr.Args) == 0 {
+			return true
+		}
+		arg0 := getCallExprLitArg(callExpr, 0)
+		if arg0 != "" && utilfn.ContainsStr(literalRtnStateCommands, arg0) {
+			return true
+		}
+		arg1 := getCallExprLitArg(callExpr, 1)
+		if arg0 == "git" {
+			if arg1 == "checkout" || arg1 == "co" || arg1 == "switch" {
+				return true
+			}
+		}
+		if arg0 == "conda" {
+			if arg1 == "activate" || arg1 == "deactivate" {
+				return true
+			}
+		}
+	} else if _, ok := cmd.(*syntax.DeclClause); ok {
+		return true
+	}
+	return false
+}
+
+func checkSimpleRtnStateCmd(cmdStr string) bool {
+	cmdStr = strings.TrimSpace(cmdStr)
+	if strings.HasPrefix(cmdStr, "function ") {
+		return true
+	}
+	firstSpace := strings.Index(cmdStr, " ")
+	if firstSpace != -1 {
+		firstWord := strings.TrimSpace(cmdStr[:firstSpace])
+		if strings.HasSuffix(firstWord, "()") {
+			return true
+		}
+	}
+	return false
+}
+
 // detects: export, declare, ., source, X=1, unset
 func IsReturnStateCommand(cmdStr string) bool {
 	cmdReader := strings.NewReader(cmdStr)
 	parser := syntax.NewParser(syntax.Variant(syntax.LangBash))
 	file, err := parser.Parse(cmdReader, "cmd")
 	if err != nil {
+		if checkSimpleRtnStateCmd(cmdStr) {
+			return true
+		}
 		return false
 	}
 	for _, stmt := range file.Stmts {
-		if callExpr, ok := stmt.Cmd.(*syntax.CallExpr); ok {
-			if len(callExpr.Assigns) > 0 && len(callExpr.Args) == 0 {
+		if isRtnStateCmd(stmt.Cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+func checkSimpleSudoCmd(cmdStr string) bool {
+	cmdStr = strings.TrimSpace(cmdStr)
+	return strings.HasPrefix(cmdStr, "sudo ")
+}
+
+func isSudoCmd(cmd syntax.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if _, ok := cmd.(*syntax.FuncDecl); ok {
+		return false
+	}
+	if blockExpr, ok := cmd.(*syntax.Block); ok {
+		for _, stmt := range blockExpr.Stmts {
+			if isSudoCmd(stmt.Cmd) {
 				return true
 			}
-			arg0 := getCallExprLitArg(callExpr, 0)
-			if arg0 != "" && utilfn.ContainsStr(literalRtnStateCommands, arg0) {
-				return true
-			}
-			if arg0 == "git" {
-				arg1 := getCallExprLitArg(callExpr, 1)
-				if arg1 == "checkout" || arg1 == "switch" {
-					return true
-				}
-			}
-		} else if _, ok := stmt.Cmd.(*syntax.DeclClause); ok {
+		}
+		return false
+	}
+	if binExpr, ok := cmd.(*syntax.BinaryCmd); ok {
+		if isSudoCmd(binExpr.X.Cmd) || isSudoCmd(binExpr.Y.Cmd) {
+			return true
+		}
+	} else if callExpr, ok := cmd.(*syntax.CallExpr); ok {
+		arg0 := getCallExprLitArg(callExpr, 0)
+		if arg0 != "" && utilfn.ContainsStr([]string{"sudo"}, arg0) {
+			return true
+		}
+	}
+	return false
+
+}
+
+func IsSudoCommand(cmdStr string) bool {
+	cmdReader := strings.NewReader(cmdStr)
+	parser := syntax.NewParser(syntax.Variant(syntax.LangBash))
+	file, err := parser.Parse(cmdReader, "sudo")
+	if err != nil {
+		return checkSimpleSudoCmd(cmdStr)
+	}
+	for _, stmt := range file.Stmts {
+		if isSudoCmd(stmt.Cmd) {
 			return true
 		}
 	}
@@ -241,7 +363,7 @@ func IsReturnStateCommand(cmdStr string) bool {
 func EvalBracketArgs(origCmdStr string) (map[string]string, string, error) {
 	rtn := make(map[string]string)
 	if strings.HasPrefix(origCmdStr, " ") {
-		rtn["nohist"] = "1"
+		rtn[KwArgNoHist] = "1"
 	}
 	cmdStr := strings.TrimSpace(origCmdStr)
 	if !strings.HasPrefix(cmdStr, "[") {
@@ -299,6 +421,8 @@ func EvalMetaCommand(ctx context.Context, origPk *scpacket.FeCommandPacketType) 
 	rtnPk.Kwargs = make(map[string]string)
 	rtnPk.UIContext = origPk.UIContext
 	rtnPk.RawStr = origPk.RawStr
+	rtnPk.Interactive = origPk.Interactive
+	rtnPk.EphemeralOpts = origPk.EphemeralOpts
 	for key, val := range origPk.Kwargs {
 		rtnPk.Kwargs[key] = val
 	}
@@ -321,7 +445,7 @@ func EvalMetaCommand(ctx context.Context, origPk *scpacket.FeCommandPacketType) 
 		return nil, fmt.Errorf("parsing metacmd, position %v", err)
 	}
 	envMap := make(map[string]string) // later we can add vars like session, screen, remote, and user
-	cfg := shexec.GetParserConfig(envMap)
+	cfg := shellapi.GetParserConfig(envMap)
 	// process arguments
 	for idx, w := range words {
 		literalVal, err := expand.Literal(cfg, w)

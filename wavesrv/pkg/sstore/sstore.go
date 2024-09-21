@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/user"
 	"path"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,12 +24,16 @@ import (
 	"github.com/sawka/txwrap"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/base"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/packet"
-	"github.com/wavetermdev/waveterm/waveshell/pkg/shexec"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/shellenv"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/dbutil"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbase"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbus"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/scpacket"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+type RemotePtrType = scpacket.RemotePtrType
 
 const LineNoHeight = -1
 const DBFileName = "waveterm.db"
@@ -40,12 +43,17 @@ const DBWALFileNameBackup = "backup.waveterm.db-wal"
 const MaxWebShareLineCount = 50
 const MaxWebShareScreenCount = 3
 const MaxLineStateSize = 4 * 1024 // 4k for now, can raise if needed
+const DefaultSudoTimeout = 5
 
 const DefaultSessionName = "default"
 const LocalRemoteAlias = "local"
 
 const DefaultCwd = "~"
 const APITokenSentinel = "--apitoken--"
+
+// defined here and not in packet.go since this value should never
+// be passed to waveshell (it should always get resolved prior to sending a run packet)
+const ShellTypePref_Detect = "detect"
 
 const (
 	LineTypeCmd    = "cmd"
@@ -56,15 +64,20 @@ const (
 const (
 	LineState_Source   = "prompt:source"
 	LineState_File     = "prompt:file"
+	LineState_FileUrl  = "wave:fileurl"
+	LineState_Min      = "wave:min"
 	LineState_Template = "template"
 	LineState_Mode     = "mode"
 	LineState_Lang     = "lang"
+	LineState_Minimap  = "minimap"
 )
 
 const (
-	MainViewSession   = "session"
-	MainViewBookmarks = "bookmarks"
-	MainViewHistory   = "history"
+	MainViewSession     = "session"
+	MainViewBookmarks   = "bookmarks"
+	MainViewHistory     = "history"
+	MainViewConnections = "connections"
+	MainViewSettings    = "clientsettings"
 )
 
 const (
@@ -73,6 +86,7 @@ const (
 	CmdStatusError    = "error"
 	CmdStatusDone     = "done"
 	CmdStatusHangup   = "hangup"
+	CmdStatusUnknown  = "unknown" // used for history items where we don't have a status
 )
 
 const (
@@ -92,6 +106,12 @@ const (
 	RemoteAuthTypeKeyPassword = "key+password"
 )
 
+const (
+	SSHConfigSrcTypeManual = "waveterm-manual"
+	SSHConfigSrcTypeImport = "sshconfig-import"
+)
+
+// TODO: move to webshare package once sstore code is more modular
 const (
 	ShareModeLocal = "local"
 	ShareModeWeb   = "web"
@@ -135,8 +155,6 @@ const (
 	UpdateType_CmdRtnState        = "cmd:rtnstate"
 	UpdateType_PtyPos             = "pty:pos"
 )
-
-const MaxTzNameLen = 50
 
 var globalDBLock = &sync.Mutex{}
 var globalDB *sqlx.DB
@@ -215,58 +233,41 @@ type ClientWinSizeType struct {
 	FullScreen bool `json:"fullscreen,omitempty"`
 }
 
-type ActivityUpdate struct {
-	FgMinutes     int
-	ActiveMinutes int
-	OpenMinutes   int
-	NumCommands   int
-	ClickShared   int
-	HistoryView   int
-	BookmarksView int
-	NumConns      int
-	WebShareLimit int
-	BuildTime     string
+type PowerMonitorEventType struct {
+	Status string `json:"status"`
 }
 
-type ActivityType struct {
-	Day           string        `json:"day"`
-	Uploaded      bool          `json:"-"`
-	TData         TelemetryData `json:"tdata"`
-	TzName        string        `json:"tzname"`
-	TzOffset      int           `json:"tzoffset"`
-	ClientVersion string        `json:"clientversion"`
-	ClientArch    string        `json:"clientarch"`
-	BuildTime     string        `json:"buildtime"`
-	OSRelease     string        `json:"osrelease"`
-}
-
-type TelemetryData struct {
-	NumCommands   int `json:"numcommands"`
-	ActiveMinutes int `json:"activeminutes"`
-	FgMinutes     int `json:"fgminutes"`
-	OpenMinutes   int `json:"openminutes"`
-	ClickShared   int `json:"clickshared,omitempty"`
-	HistoryView   int `json:"historyview,omitempty"`
-	BookmarksView int `json:"bookmarksview,omitempty"`
-	NumConns      int `json:"numconns"`
-	WebShareLimit int `json:"websharelimit,omitempty"`
-}
-
-func (tdata TelemetryData) Value() (driver.Value, error) {
-	return quickValueJson(tdata)
-}
-
-func (tdata *TelemetryData) Scan(val interface{}) error {
-	return quickScanJson(tdata, val)
+type SidebarValueType struct {
+	Collapsed bool `json:"collapsed"`
+	Width     int  `json:"width"`
 }
 
 type ClientOptsType struct {
-	NoTelemetry bool  `json:"notelemetry,omitempty"`
-	AcceptedTos int64 `json:"acceptedtos,omitempty"`
+	NoTelemetry           bool              `json:"notelemetry,omitempty"`
+	NoReleaseCheck        bool              `json:"noreleasecheck,omitempty"`
+	AcceptedTos           int64             `json:"acceptedtos,omitempty"`
+	ConfirmFlags          map[string]bool   `json:"confirmflags,omitempty"`
+	MainSidebar           *SidebarValueType `json:"mainsidebar,omitempty"`
+	RightSidebar          *SidebarValueType `json:"rightsidebar,omitempty"`
+	GlobalShortcut        string            `json:"globalshortcut,omitempty"`
+	GlobalShortcutEnabled bool              `json:"globalshortcutenabled,omitempty"`
+	WebGL                 bool              `json:"webgl,omitempty"`
+	AutocompleteEnabled   bool              `json:"autocompleteenabled,omitempty"`
 }
 
 type FeOptsType struct {
-	TermFontSize int `json:"termfontsize,omitempty"`
+	TermFontSize         int               `json:"termfontsize,omitempty"`
+	TermFontFamily       string            `json:"termfontfamily,omitempty"`
+	Theme                string            `json:"theme,omitempty"`
+	TermThemeSettings    map[string]string `json:"termthemesettings"`
+	SudoPwStore          string            `json:"sudopwstore,omitempty"`
+	SudoPwTimeoutMs      int               `json:"sudopwtimeoutms,omitempty"`
+	SudoPwTimeout        int               `json:"sudopwtimeout,omitempty"`
+	NoSudoPwClearOnSleep bool              `json:"nosudopwclearonsleep,omitempty"`
+}
+
+type ReleaseInfoType struct {
+	LatestVersion string `json:"latestversion,omitempty"`
 }
 
 type ClientData struct {
@@ -283,6 +284,7 @@ type ClientData struct {
 	CmdStoreType        string            `json:"cmdstoretype"`
 	DBVersion           int               `json:"dbversion" dbmap:"-"`
 	OpenAIOpts          *OpenAIOptsType   `json:"openaiopts,omitempty" dbmap:"openaiopts"`
+	ReleaseInfo         ReleaseInfoType   `json:"releaseinfo"`
 }
 
 func (ClientData) UseDBMap() {}
@@ -297,6 +299,8 @@ func (cdata *ClientData) Clean() *ClientData {
 			Model:      cdata.OpenAIOpts.Model,
 			MaxTokens:  cdata.OpenAIOpts.MaxTokens,
 			MaxChoices: cdata.OpenAIOpts.MaxChoices,
+			Timeout:    cdata.OpenAIOpts.Timeout,
+			BaseURL:    cdata.OpenAIOpts.BaseURL,
 			// omit API Token
 		}
 		if cdata.OpenAIOpts.APIToken != "" {
@@ -304,6 +308,10 @@ func (cdata *ClientData) Clean() *ClientData {
 		}
 	}
 	return &rtn
+}
+
+func (ClientData) GetType() string {
+	return "clientdata"
 }
 
 type SessionType struct {
@@ -319,7 +327,29 @@ type SessionType struct {
 
 	// only for updates
 	Remove bool `json:"remove,omitempty"`
-	Full   bool `json:"full,omitempty"`
+}
+
+func (SessionType) GetType() string {
+	return "session"
+}
+
+func MakeSessionUpdateForRemote(sessionId string, ri *RemoteInstance) SessionType {
+	return SessionType{
+		SessionId: sessionId,
+		Remotes:   []*RemoteInstance{ri},
+	}
+}
+
+type SessionTombstoneType struct {
+	SessionId string `json:"sessionid"`
+	Name      string `json:"name"`
+	DeletedTs int64  `json:"deletedts"`
+}
+
+func (SessionTombstoneType) UseDBMap() {}
+
+func (SessionTombstoneType) GetType() string {
+	return "sessiontombstone"
 }
 
 type SessionStatsType struct {
@@ -331,109 +361,9 @@ type SessionStatsType struct {
 	DiskStats          SessionDiskSizeType `json:"diskstats"`
 }
 
-var RemoteNameRe = regexp.MustCompile("^\\*?[a-zA-Z0-9_-]+$")
-
-type RemotePtrType struct {
-	OwnerId  string `json:"ownerid"`
-	RemoteId string `json:"remoteid"`
-	Name     string `json:"name"`
-}
-
-func (r RemotePtrType) IsSessionScope() bool {
-	return strings.HasPrefix(r.Name, "*")
-}
-
-func (rptr *RemotePtrType) GetDisplayName(baseDisplayName string) string {
-	name := baseDisplayName
-	if rptr == nil {
-		return name
-	}
-	if rptr.Name != "" {
-		name = name + ":" + rptr.Name
-	}
-	if rptr.OwnerId != "" {
-		name = "@" + rptr.OwnerId + ":" + name
-	}
-	return name
-}
-
-func (r RemotePtrType) Validate() error {
-	if r.OwnerId != "" {
-		if _, err := uuid.Parse(r.OwnerId); err != nil {
-			return fmt.Errorf("invalid ownerid format: %v", err)
-		}
-	}
-	if r.RemoteId != "" {
-		if _, err := uuid.Parse(r.RemoteId); err != nil {
-			return fmt.Errorf("invalid remoteid format: %v", err)
-		}
-	}
-	if r.Name != "" {
-		ok := RemoteNameRe.MatchString(r.Name)
-		if !ok {
-			return fmt.Errorf("invalid remote name")
-		}
-	}
-	return nil
-}
-
-func (r RemotePtrType) MakeFullRemoteRef() string {
-	if r.RemoteId == "" {
-		return ""
-	}
-	if r.OwnerId == "" && r.Name == "" {
-		return r.RemoteId
-	}
-	if r.OwnerId != "" && r.Name == "" {
-		return fmt.Sprintf("@%s:%s", r.OwnerId, r.RemoteId)
-	}
-	if r.OwnerId == "" && r.Name != "" {
-		return fmt.Sprintf("%s:%s", r.RemoteId, r.Name)
-	}
-	return fmt.Sprintf("@%s:%s:%s", r.OwnerId, r.RemoteId, r.Name)
-}
-
-func (h *HistoryItemType) ToMap() map[string]interface{} {
-	rtn := make(map[string]interface{})
-	rtn["historyid"] = h.HistoryId
-	rtn["ts"] = h.Ts
-	rtn["userid"] = h.UserId
-	rtn["sessionid"] = h.SessionId
-	rtn["screenid"] = h.ScreenId
-	rtn["lineid"] = h.LineId
-	rtn["linenum"] = h.LineNum
-	rtn["haderror"] = h.HadError
-	rtn["cmdstr"] = h.CmdStr
-	rtn["remoteownerid"] = h.Remote.OwnerId
-	rtn["remoteid"] = h.Remote.RemoteId
-	rtn["remotename"] = h.Remote.Name
-	rtn["ismetacmd"] = h.IsMetaCmd
-	rtn["incognito"] = h.Incognito
-	return rtn
-}
-
-func (h *HistoryItemType) FromMap(m map[string]interface{}) bool {
-	quickSetStr(&h.HistoryId, m, "historyid")
-	quickSetInt64(&h.Ts, m, "ts")
-	quickSetStr(&h.UserId, m, "userid")
-	quickSetStr(&h.SessionId, m, "sessionid")
-	quickSetStr(&h.ScreenId, m, "screenid")
-	quickSetStr(&h.LineId, m, "lineid")
-	quickSetBool(&h.HadError, m, "haderror")
-	quickSetStr(&h.CmdStr, m, "cmdstr")
-	quickSetStr(&h.Remote.OwnerId, m, "remoteownerid")
-	quickSetStr(&h.Remote.RemoteId, m, "remoteid")
-	quickSetStr(&h.Remote.Name, m, "remotename")
-	quickSetBool(&h.IsMetaCmd, m, "ismetacmd")
-	quickSetStr(&h.HistoryNum, m, "historynum")
-	quickSetInt64(&h.LineNum, m, "linenum")
-	quickSetBool(&h.Incognito, m, "incognito")
-	return true
-}
-
 type ScreenOptsType struct {
 	TabColor string `json:"tabcolor,omitempty"`
-	TabIcon string `json:"tabicon,omitempty"`
+	TabIcon  string `json:"tabicon,omitempty"`
 	PTerm    string `json:"pterm,omitempty"`
 }
 
@@ -445,6 +375,10 @@ type ScreenLinesType struct {
 
 func (ScreenLinesType) UseDBMap() {}
 
+func (ScreenLinesType) GetType() string {
+	return "screenlines"
+}
+
 type ScreenWebShareOpts struct {
 	ShareName string `json:"sharename"`
 	ViewKey   string `json:"viewkey"`
@@ -455,31 +389,44 @@ type ScreenCreateOpts struct {
 	CopyRemote   bool
 	CopyCwd      bool
 	CopyEnv      bool
+	RtnScreenId  *string
 }
 
 func (sco ScreenCreateOpts) HasCopy() bool {
 	return sco.CopyRemote || sco.CopyCwd || sco.CopyEnv
 }
 
+type ScreenSidebarOptsType struct {
+	Open  bool   `json:"open,omitempty"`
+	Width string `json:"width,omitempty"`
+
+	// this used to be more complicated (sections with types).  simplified for this release
+	SidebarLineId string `json:"sidebarlineid,omitempty"`
+}
+
+type ScreenViewOptsType struct {
+	Sidebar *ScreenSidebarOptsType `json:"sidebar,omitempty"`
+}
+
 type ScreenType struct {
-	SessionId    string              `json:"sessionid"`
-	ScreenId     string              `json:"screenid"`
-	Name         string              `json:"name"`
-	ScreenIdx    int64               `json:"screenidx"`
-	ScreenOpts   ScreenOptsType      `json:"screenopts"`
-	OwnerId      string              `json:"ownerid"`
-	ShareMode    string              `json:"sharemode"`
-	WebShareOpts *ScreenWebShareOpts `json:"webshareopts,omitempty"`
-	CurRemote    RemotePtrType       `json:"curremote"`
-	NextLineNum  int64               `json:"nextlinenum"`
-	SelectedLine int64               `json:"selectedline"`
-	Anchor       ScreenAnchorType    `json:"anchor"`
-	FocusType    string              `json:"focustype"`
-	Archived     bool                `json:"archived,omitempty"`
-	ArchivedTs   int64               `json:"archivedts,omitempty"`
+	SessionId      string              `json:"sessionid"`
+	ScreenId       string              `json:"screenid"`
+	Name           string              `json:"name"`
+	ScreenIdx      int64               `json:"screenidx"`
+	ScreenOpts     ScreenOptsType      `json:"screenopts"`
+	ScreenViewOpts ScreenViewOptsType  `json:"screenviewopts"`
+	OwnerId        string              `json:"ownerid"`
+	ShareMode      string              `json:"sharemode"`
+	WebShareOpts   *ScreenWebShareOpts `json:"webshareopts,omitempty"`
+	CurRemote      RemotePtrType       `json:"curremote"`
+	NextLineNum    int64               `json:"nextlinenum"`
+	SelectedLine   int64               `json:"selectedline"`
+	Anchor         ScreenAnchorType    `json:"anchor"`
+	FocusType      string              `json:"focustype"`
+	Archived       bool                `json:"archived,omitempty"`
+	ArchivedTs     int64               `json:"archivedts,omitempty"`
 
 	// only for updates
-	Full   bool `json:"full,omitempty"`
 	Remove bool `json:"remove,omitempty"`
 }
 
@@ -490,6 +437,7 @@ func (s *ScreenType) ToMap() map[string]interface{} {
 	rtn["name"] = s.Name
 	rtn["screenidx"] = s.ScreenIdx
 	rtn["screenopts"] = quickJson(s.ScreenOpts)
+	rtn["screenviewopts"] = quickJson(s.ScreenViewOpts)
 	rtn["ownerid"] = s.OwnerId
 	rtn["sharemode"] = s.ShareMode
 	rtn["webshareopts"] = quickNullableJson(s.WebShareOpts)
@@ -511,6 +459,7 @@ func (s *ScreenType) FromMap(m map[string]interface{}) bool {
 	quickSetStr(&s.Name, m, "name")
 	quickSetInt64(&s.ScreenIdx, m, "screenidx")
 	quickSetJson(&s.ScreenOpts, m, "screenopts")
+	quickSetJson(&s.ScreenViewOpts, m, "screenviewopts")
 	quickSetStr(&s.OwnerId, m, "ownerid")
 	quickSetStr(&s.ShareMode, m, "sharemode")
 	quickSetNullableJson(&s.WebShareOpts, m, "webshareopts")
@@ -524,6 +473,38 @@ func (s *ScreenType) FromMap(m map[string]interface{}) bool {
 	quickSetBool(&s.Archived, m, "archived")
 	quickSetInt64(&s.ArchivedTs, m, "archivedts")
 	return true
+}
+
+func (ScreenType) GetType() string {
+	return "screen"
+}
+
+func AddScreenUpdate(update *scbus.ModelUpdatePacketType, newScreen *ScreenType) {
+	if newScreen == nil {
+		return
+	}
+	screenUpdates := scbus.GetUpdateItems[ScreenType](update)
+	for _, screenUpdate := range screenUpdates {
+		if screenUpdate.ScreenId == newScreen.ScreenId {
+			screenUpdate = newScreen
+			return
+		}
+	}
+	update.AddUpdate(newScreen)
+}
+
+type ScreenTombstoneType struct {
+	ScreenId   string         `json:"screenid"`
+	SessionId  string         `json:"sessionid"`
+	Name       string         `json:"name"`
+	DeletedTs  int64          `json:"deletedts"`
+	ScreenOpts ScreenOptsType `json:"screenopts"`
+}
+
+func (ScreenTombstoneType) UseDBMap() {}
+
+func (ScreenTombstoneType) GetType() string {
+	return "screentombstone"
 }
 
 const (
@@ -556,51 +537,6 @@ type ScreenAnchorType struct {
 	AnchorOffset int `json:"anchoroffset,omitempty"`
 }
 
-type HistoryItemType struct {
-	HistoryId string        `json:"historyid"`
-	Ts        int64         `json:"ts"`
-	UserId    string        `json:"userid"`
-	SessionId string        `json:"sessionid"`
-	ScreenId  string        `json:"screenid"`
-	LineId    string        `json:"lineid"`
-	HadError  bool          `json:"haderror"`
-	CmdStr    string        `json:"cmdstr"`
-	Remote    RemotePtrType `json:"remote"`
-	IsMetaCmd bool          `json:"ismetacmd"`
-	Incognito bool          `json:"incognito,omitempty"`
-
-	// only for updates
-	Remove bool `json:"remove"`
-
-	// transient (string because of different history orderings)
-	HistoryNum string `json:"historynum"`
-	LineNum    int64  `json:"linenum"`
-}
-
-type HistoryQueryOpts struct {
-	Offset     int
-	MaxItems   int
-	FromTs     int64
-	SearchText string
-	SessionId  string
-	RemoteId   string
-	ScreenId   string
-	NoMeta     bool
-	RawOffset  int
-	FilterFn   func(*HistoryItemType) bool
-}
-
-type HistoryQueryResult struct {
-	MaxItems      int
-	Items         []*HistoryItemType
-	Offset        int // the offset shown to user
-	RawOffset     int // internal offset
-	HasMore       bool
-	NextRawOffset int // internal offset used by pager for next query
-
-	prevItems int // holds number of items skipped by RawOffset
-}
-
 type TermOpts struct {
 	Rows       int64 `json:"rows"`
 	Cols       int64 `json:"cols"`
@@ -616,18 +552,6 @@ func (opts TermOpts) Value() (driver.Value, error) {
 	return quickValueJson(opts)
 }
 
-type ShellStatePtr struct {
-	BaseHash    string
-	DiffHashArr []string
-}
-
-func (ssptr *ShellStatePtr) IsEmpty() bool {
-	if ssptr == nil || ssptr.BaseHash == "" {
-		return true
-	}
-	return false
-}
-
 type RemoteInstance struct {
 	RIId             string            `json:"riid"`
 	Name             string            `json:"name"`
@@ -636,6 +560,7 @@ type RemoteInstance struct {
 	RemoteOwnerId    string            `json:"remoteownerid"`
 	RemoteId         string            `json:"remoteid"`
 	FeState          map[string]string `json:"festate"`
+	ShellType        string            `json:"shelltype"`
 	StateBaseHash    string            `json:"-"`
 	StateDiffHashArr []string          `json:"-"`
 
@@ -683,14 +608,22 @@ func FeStateFromShellState(state *packet.ShellState) map[string]string {
 	}
 	rtn := make(map[string]string)
 	rtn["cwd"] = state.Cwd
-	envMap := shexec.EnvMapFromState(state)
-	if envMap["VIRTUAL_ENV"] != "" {
-		rtn["VIRTUAL_ENV"] = envMap["VIRTUAL_ENV"]
+	declMap := shellenv.DeclMapFromState(state)
+	if decl, ok := declMap["VIRTUAL_ENV"]; ok {
+		rtn["VIRTUAL_ENV"] = decl.UnescapedValue()
 	}
-	for key, val := range envMap {
-		if strings.HasPrefix(key, "PROMPTVAR_") {
-			rtn[key] = val
+	if decl, ok := declMap["CONDA_DEFAULT_ENV"]; ok {
+		rtn["CONDA_DEFAULT_ENV"] = decl.UnescapedValue()
+	}
+	for _, decl := range declMap {
+		// works for both legacy and new IsExtVar decls
+		if strings.HasPrefix(decl.Name, "PROMPTVAR_") {
+			rtn[decl.Name] = decl.UnescapedValue()
 		}
+	}
+	_, _, err := packet.ParseShellStateVersion(state.Version)
+	if err != nil {
+		rtn["invalidstate"] = "1"
 	}
 	return rtn
 }
@@ -705,6 +638,7 @@ func (ri *RemoteInstance) FromMap(m map[string]interface{}) bool {
 	quickSetJson(&ri.FeState, m, "festate")
 	quickSetStr(&ri.StateBaseHash, m, "statebasehash")
 	quickSetJsonArr(&ri.StateDiffHashArr, m, "statediffhasharr")
+	quickSetStr(&ri.ShellType, m, "shelltype")
 	return true
 }
 
@@ -719,6 +653,7 @@ func (ri *RemoteInstance) ToMap() map[string]interface{} {
 	rtn["festate"] = quickJson(ri.FeState)
 	rtn["statebasehash"] = ri.StateBaseHash
 	rtn["statediffhasharr"] = quickJsonArr(ri.StateDiffHashArr)
+	rtn["shelltype"] = ri.ShellType
 	return rtn
 }
 
@@ -772,120 +707,6 @@ type OpenAIResponse struct {
 	Choices []OpenAIChoiceType `json:"choices,omitempty"`
 }
 
-type OpenAIPromptMessageType struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Name    string `json:"name,omitempty"`
-}
-
-type PlaybookType struct {
-	PlaybookId   string   `json:"playbookid"`
-	PlaybookName string   `json:"playbookname"`
-	Description  string   `json:"description"`
-	EntryIds     []string `json:"entryids"`
-
-	// this is not persisted to DB, just for transport to FE
-	Entries []*PlaybookEntry `json:"entries"`
-}
-
-func (p *PlaybookType) ToMap() map[string]interface{} {
-	rtn := make(map[string]interface{})
-	rtn["playbookid"] = p.PlaybookId
-	rtn["playbookname"] = p.PlaybookName
-	rtn["description"] = p.Description
-	rtn["entryids"] = quickJsonArr(p.EntryIds)
-	return rtn
-}
-
-func (p *PlaybookType) FromMap(m map[string]interface{}) bool {
-	quickSetStr(&p.PlaybookId, m, "playbookid")
-	quickSetStr(&p.PlaybookName, m, "playbookname")
-	quickSetStr(&p.Description, m, "description")
-	quickSetJsonArr(&p.Entries, m, "entries")
-	return true
-}
-
-// reorders p.Entries to match p.EntryIds
-func (p *PlaybookType) OrderEntries() {
-	if len(p.Entries) == 0 {
-		return
-	}
-	m := make(map[string]*PlaybookEntry)
-	for _, entry := range p.Entries {
-		m[entry.EntryId] = entry
-	}
-	newList := make([]*PlaybookEntry, 0, len(p.EntryIds))
-	for _, entryId := range p.EntryIds {
-		entry := m[entryId]
-		if entry != nil {
-			newList = append(newList, entry)
-		}
-	}
-	p.Entries = newList
-}
-
-// removes from p.EntryIds (not from p.Entries)
-func (p *PlaybookType) RemoveEntry(entryIdToRemove string) {
-	if len(p.EntryIds) == 0 {
-		return
-	}
-	newList := make([]string, 0, len(p.EntryIds)-1)
-	for _, entryId := range p.EntryIds {
-		if entryId == entryIdToRemove {
-			continue
-		}
-		newList = append(newList, entryId)
-	}
-	p.EntryIds = newList
-}
-
-type PlaybookEntry struct {
-	PlaybookId  string `json:"playbookid"`
-	EntryId     string `json:"entryid"`
-	Alias       string `json:"alias"`
-	CmdStr      string `json:"cmdstr"`
-	UpdatedTs   int64  `json:"updatedts"`
-	CreatedTs   int64  `json:"createdts"`
-	Description string `json:"description"`
-	Remove      bool   `json:"remove,omitempty"`
-}
-
-type BookmarkType struct {
-	BookmarkId  string   `json:"bookmarkid"`
-	CreatedTs   int64    `json:"createdts"`
-	CmdStr      string   `json:"cmdstr"`
-	Alias       string   `json:"alias,omitempty"`
-	Tags        []string `json:"tags"`
-	Description string   `json:"description"`
-	OrderIdx    int64    `json:"orderidx"`
-	Remove      bool     `json:"remove,omitempty"`
-}
-
-func (bm *BookmarkType) GetSimpleKey() string {
-	return bm.BookmarkId
-}
-
-func (bm *BookmarkType) ToMap() map[string]interface{} {
-	rtn := make(map[string]interface{})
-	rtn["bookmarkid"] = bm.BookmarkId
-	rtn["createdts"] = bm.CreatedTs
-	rtn["cmdstr"] = bm.CmdStr
-	rtn["alias"] = bm.Alias
-	rtn["description"] = bm.Description
-	rtn["tags"] = quickJsonArr(bm.Tags)
-	return rtn
-}
-
-func (bm *BookmarkType) FromMap(m map[string]interface{}) bool {
-	quickSetStr(&bm.BookmarkId, m, "bookmarkid")
-	quickSetInt64(&bm.CreatedTs, m, "createdts")
-	quickSetStr(&bm.Alias, m, "alias")
-	quickSetStr(&bm.CmdStr, m, "cmdstr")
-	quickSetStr(&bm.Description, m, "description")
-	quickSetJsonArr(&bm.Tags, m, "tags")
-	return true
-}
-
 type ResolveItem struct {
 	Name   string
 	Num    int
@@ -924,8 +745,85 @@ type RemoteOptsType struct {
 type OpenAIOptsType struct {
 	Model      string `json:"model"`
 	APIToken   string `json:"apitoken"`
+	BaseURL    string `json:"baseurl,omitempty"`
 	MaxTokens  int    `json:"maxtokens,omitempty"`
 	MaxChoices int    `json:"maxchoices,omitempty"`
+	Timeout    int    `json:"timeout,omitempty"`
+}
+
+const (
+	RemoteStatus_Connected    = "connected"
+	RemoteStatus_Connecting   = "connecting"
+	RemoteStatus_Disconnected = "disconnected"
+	RemoteStatus_Error        = "error"
+)
+
+type RemoteRuntimeState struct {
+	RemoteType            string            `json:"remotetype"`
+	RemoteId              string            `json:"remoteid"`
+	RemoteAlias           string            `json:"remotealias,omitempty"`
+	RemoteCanonicalName   string            `json:"remotecanonicalname"`
+	RemoteVars            map[string]string `json:"remotevars"`
+	Status                string            `json:"status"`
+	ConnectTimeout        int               `json:"connecttimeout,omitempty"`
+	CountdownActive       bool              `json:"countdownactive"`
+	ErrorStr              string            `json:"errorstr,omitempty"`
+	InstallStatus         string            `json:"installstatus"`
+	InstallErrorStr       string            `json:"installerrorstr,omitempty"`
+	NeedsWaveshellUpgrade bool              `json:"needswaveshellupgrade,omitempty"`
+	NoInitPk              bool              `json:"noinitpk,omitempty"`
+	AuthType              string            `json:"authtype,omitempty"`
+	ConnectMode           string            `json:"connectmode"`
+	AutoInstall           bool              `json:"autoinstall"`
+	Archived              bool              `json:"archived,omitempty"`
+	RemoteIdx             int64             `json:"remoteidx"`
+	SSHConfigSrc          string            `json:"sshconfigsrc"`
+	UName                 string            `json:"uname"`
+	WaveshellVersion      string            `json:"waveshellversion"`
+	WaitingForPassword    bool              `json:"waitingforpassword,omitempty"`
+	Local                 bool              `json:"local,omitempty"`
+	IsSudo                bool              `json:"issudo,omitempty"`
+	RemoteOpts            *RemoteOptsType   `json:"remoteopts,omitempty"`
+	CanComplete           bool              `json:"cancomplete,omitempty"`
+	ShellPref             string            `json:"shellpref,omitempty"`
+	DefaultShellType      string            `json:"defaultshelltype,omitempty"`
+}
+
+func (state RemoteRuntimeState) IsConnected() bool {
+	return state.Status == RemoteStatus_Connected
+}
+
+func (state RemoteRuntimeState) GetBaseDisplayName() string {
+	if state.RemoteAlias != "" {
+		return state.RemoteAlias
+	}
+	return state.RemoteCanonicalName
+}
+
+func (state RemoteRuntimeState) GetDisplayName(rptr *RemotePtrType) string {
+	baseDisplayName := state.GetBaseDisplayName()
+	if rptr == nil {
+		return baseDisplayName
+	}
+	return rptr.GetDisplayName(baseDisplayName)
+}
+
+func (state RemoteRuntimeState) ExpandHomeDir(pathStr string) (string, error) {
+	if pathStr != "~" && !strings.HasPrefix(pathStr, "~/") {
+		return pathStr, nil
+	}
+	homeDir := state.RemoteVars["home"]
+	if homeDir == "" {
+		return "", fmt.Errorf("remote does not have HOME set, cannot do ~ expansion")
+	}
+	if pathStr == "~" {
+		return homeDir, nil
+	}
+	return path.Join(homeDir, pathStr[2:]), nil
+}
+
+func (RemoteRuntimeState) GetType() string {
+	return "remote"
 }
 
 type RemoteType struct {
@@ -939,16 +837,22 @@ type RemoteType struct {
 	Archived            bool            `json:"archived"`
 
 	// SSH fields
-	Local       bool              `json:"local"`
-	RemoteUser  string            `json:"remoteuser"`
-	RemoteHost  string            `json:"remotehost"`
-	ConnectMode string            `json:"connectmode"`
-	AutoInstall bool              `json:"autoinstall"`
-	SSHOpts     *SSHOpts          `json:"sshopts"`
-	StateVars   map[string]string `json:"statevars"`
+	Local        bool              `json:"local"`
+	RemoteUser   string            `json:"remoteuser"`
+	RemoteHost   string            `json:"remotehost"`
+	ConnectMode  string            `json:"connectmode"`
+	AutoInstall  bool              `json:"autoinstall"`
+	SSHOpts      *SSHOpts          `json:"sshopts"`
+	StateVars    map[string]string `json:"statevars"`
+	SSHConfigSrc string            `json:"sshconfigsrc"`
+	ShellPref    string            `json:"shellpref"` // bash, zsh, or detect
 
-	// OpenAI fields
+	// OpenAI fields (unused)
 	OpenAIOpts *OpenAIOptsType `json:"openaiopts,omitempty"`
+}
+
+func (r *RemoteType) IsLocal() bool {
+	return r.Local && !r.IsSudo()
 }
 
 func (r *RemoteType) IsSudo() bool {
@@ -960,28 +864,6 @@ func (r *RemoteType) GetName() string {
 		return r.RemoteAlias
 	}
 	return r.RemoteCanonicalName
-}
-
-type CmdType struct {
-	ScreenId     string              `json:"screenid"`
-	LineId       string              `json:"lineid"`
-	Remote       RemotePtrType       `json:"remote"`
-	CmdStr       string              `json:"cmdstr"`
-	RawCmdStr    string              `json:"rawcmdstr"`
-	FeState      map[string]string   `json:"festate"`
-	StatePtr     ShellStatePtr       `json:"state"`
-	TermOpts     TermOpts            `json:"termopts"`
-	OrigTermOpts TermOpts            `json:"origtermopts"`
-	Status       string              `json:"status"`
-	CmdPid       int                 `json:"cmdpid"`
-	RemotePid    int                 `json:"remotepid"`
-	DoneTs       int64               `json:"donets"`
-	ExitCode     int                 `json:"exitcode"`
-	DurationMs   int                 `json:"durationms"`
-	RunOut       []packet.PacketType `json:"runout,omitempty"`
-	RtnState     bool                `json:"rtnstate,omitempty"`
-	RtnStatePtr  ShellStatePtr       `json:"rtnstateptr,omitempty"`
-	Remove       bool                `json:"remove,omitempty"`
 }
 
 func (r *RemoteType) ToMap() map[string]interface{} {
@@ -1001,7 +883,9 @@ func (r *RemoteType) ToMap() map[string]interface{} {
 	rtn["remoteidx"] = r.RemoteIdx
 	rtn["local"] = r.Local
 	rtn["statevars"] = quickJson(r.StateVars)
+	rtn["sshconfigsrc"] = r.SSHConfigSrc
 	rtn["openaiopts"] = quickJson(r.OpenAIOpts)
+	rtn["shellpref"] = r.ShellPref
 	return rtn
 }
 
@@ -1021,8 +905,38 @@ func (r *RemoteType) FromMap(m map[string]interface{}) bool {
 	quickSetInt64(&r.RemoteIdx, m, "remoteidx")
 	quickSetBool(&r.Local, m, "local")
 	quickSetJson(&r.StateVars, m, "statevars")
+	quickSetStr(&r.SSHConfigSrc, m, "sshconfigsrc")
 	quickSetJson(&r.OpenAIOpts, m, "openaiopts")
+	quickSetStr(&r.ShellPref, m, "shellpref")
 	return true
+}
+
+type CmdType struct {
+	ScreenId     string               `json:"screenid"`
+	LineId       string               `json:"lineid"`
+	Remote       RemotePtrType        `json:"remote"`
+	CmdStr       string               `json:"cmdstr"`
+	RawCmdStr    string               `json:"rawcmdstr"`
+	FeState      map[string]string    `json:"festate"`
+	StatePtr     packet.ShellStatePtr `json:"state"`
+	TermOpts     TermOpts             `json:"termopts"`
+	OrigTermOpts TermOpts             `json:"origtermopts"`
+	Status       string               `json:"status"`
+	CmdPid       int                  `json:"cmdpid"`
+	RemotePid    int                  `json:"remotepid"`
+	RestartTs    int64                `json:"restartts,omitempty"`
+	DoneTs       int64                `json:"donets"`
+	ExitCode     int                  `json:"exitcode"`
+	DurationMs   int                  `json:"durationms"`
+	RunOut       []packet.PacketType  `json:"runout,omitempty"`
+	RtnState     bool                 `json:"rtnstate,omitempty"`
+	RtnStatePtr  packet.ShellStatePtr `json:"rtnstateptr,omitempty"`
+	Remove       bool                 `json:"remove,omitempty"`    // not persisted to DB
+	Restarted    bool                 `json:"restarted,omitempty"` // not persisted to DB
+}
+
+func (CmdType) GetType() string {
+	return "cmd"
 }
 
 func (cmd *CmdType) ToMap() map[string]interface{} {
@@ -1042,6 +956,7 @@ func (cmd *CmdType) ToMap() map[string]interface{} {
 	rtn["status"] = cmd.Status
 	rtn["cmdpid"] = cmd.CmdPid
 	rtn["remotepid"] = cmd.RemotePid
+	rtn["restartts"] = cmd.RestartTs
 	rtn["donets"] = cmd.DoneTs
 	rtn["exitcode"] = cmd.ExitCode
 	rtn["durationms"] = cmd.DurationMs
@@ -1069,6 +984,7 @@ func (cmd *CmdType) FromMap(m map[string]interface{}) bool {
 	quickSetInt(&cmd.CmdPid, m, "cmdpid")
 	quickSetInt(&cmd.RemotePid, m, "remotepid")
 	quickSetInt64(&cmd.DoneTs, m, "donets")
+	quickSetInt64(&cmd.RestartTs, m, "restartts")
 	quickSetInt(&cmd.ExitCode, m, "exitcode")
 	quickSetInt(&cmd.DurationMs, m, "durationms")
 	quickSetJson(&cmd.RunOut, m, "runout")
@@ -1183,6 +1099,8 @@ func EnsureLocalRemote(ctx context.Context) error {
 		AutoInstall:         true,
 		SSHOpts:             &SSHOpts{Local: true},
 		Local:               true,
+		SSHConfigSrc:        SSHConfigSrcTypeManual,
+		ShellPref:           ShellTypePref_Detect,
 	}
 	err = UpsertRemote(ctx, localRemote)
 	if err != nil {
@@ -1201,27 +1119,14 @@ func EnsureLocalRemote(ctx context.Context) error {
 		SSHOpts:             &SSHOpts{Local: true, IsSudo: true},
 		RemoteOpts:          &RemoteOptsType{Color: "red"},
 		Local:               true,
+		SSHConfigSrc:        SSHConfigSrcTypeManual,
+		ShellPref:           ShellTypePref_Detect,
 	}
 	err = UpsertRemote(ctx, sudoRemote)
 	if err != nil {
 		return err
 	}
 	log.Printf("[db] added sudo remote '%s', id=%s\n", sudoRemote.RemoteCanonicalName, sudoRemote.RemoteId)
-	return nil
-}
-
-func EnsureOneSession(ctx context.Context) error {
-	numSessions, err := GetSessionCount(ctx)
-	if err != nil {
-		return err
-	}
-	if numSessions > 0 {
-		return nil
-	}
-	_, err = InsertSessionWithName(ctx, DefaultSessionName, true)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -1247,9 +1152,10 @@ func createClientData(tx *TxWrap) error {
 		ActiveSessionId:     "",
 		WinSize:             ClientWinSizeType{},
 		CmdStoreType:        CmdStoreTypeScreen,
+		ReleaseInfo:         ReleaseInfoType{},
 	}
-	query := `INSERT INTO client ( clientid, userid, activesessionid, userpublickeybytes, userprivatekeybytes, winsize, cmdstoretype) 
-                          VALUES (:clientid,:userid,:activesessionid,:userpublickeybytes,:userprivatekeybytes,:winsize,:cmdstoretype)`
+	query := `INSERT INTO client ( clientid, userid, activesessionid, userpublickeybytes, userprivatekeybytes, winsize, cmdstoretype, releaseinfo) 
+                          VALUES (:clientid,:userid,:activesessionid,:userpublickeybytes,:userprivatekeybytes,:winsize,:cmdstoretype,:releaseinfo)`
 	tx.NamedExec(query, dbutil.ToDBMap(c, false))
 	log.Printf("create new clientid[%s] userid[%s] with public/private keypair\n", c.ClientId, c.UserId)
 	return nil
@@ -1308,4 +1214,89 @@ func SetClientOpts(ctx context.Context, clientOpts ClientOptsType) error {
 		return nil
 	})
 	return txErr
+}
+
+func SetReleaseInfo(ctx context.Context, releaseInfo ReleaseInfoType) error {
+	txErr := WithTx(ctx, func(tx *TxWrap) error {
+		query := `UPDATE client SET releaseinfo = ?`
+		tx.Exec(query, quickJson(releaseInfo))
+		return nil
+	})
+	return txErr
+}
+
+// Sets the in-memory status indicator for the given screenId to the given value and adds it to the ModelUpdate. By default, the active screen will be ignored when updating status. To force a status update for the active screen, set force=true.
+func SetStatusIndicatorLevel_Update(ctx context.Context, update *scbus.ModelUpdatePacketType, screenId string, level StatusIndicatorLevel, force bool) error {
+	var newStatus StatusIndicatorLevel
+	if force {
+		// Force the update and set the new status to the given level, regardless of the current status or the active screen
+		ScreenMemSetIndicatorLevel(screenId, level)
+		newStatus = level
+	} else {
+		// Only update the status if the given screen is not the active screen and if the given level is higher than the current level
+		activeSessionId, err := GetActiveSessionId(ctx)
+		if err != nil {
+			return fmt.Errorf("error getting active session id: %w", err)
+		}
+		bareSession, err := GetBareSessionById(ctx, activeSessionId)
+		if err != nil {
+			return fmt.Errorf("error getting bare session: %w", err)
+		}
+		activeScreenId := bareSession.ActiveScreenId
+		if activeScreenId == screenId {
+			return nil
+		}
+
+		// If we are not forcing the update, follow the rules for combining status indicators
+		newLevel := ScreenMemCombineIndicatorLevels(screenId, level)
+		if newLevel == level {
+			newStatus = level
+		} else {
+			return nil
+		}
+	}
+
+	update.AddUpdate(ScreenStatusIndicatorType{
+		ScreenId: screenId,
+		Status:   newStatus,
+	})
+	return nil
+}
+
+// Sets the in-memory status indicator for the given screenId to the given value and pushes the new value to the FE
+func SetStatusIndicatorLevel(ctx context.Context, screenId string, level StatusIndicatorLevel, force bool) error {
+	update := scbus.MakeUpdatePacket()
+	err := SetStatusIndicatorLevel_Update(ctx, update, screenId, level, false)
+	if err != nil {
+		return err
+	}
+	scbus.MainUpdateBus.DoUpdate(update)
+	return nil
+}
+
+// Resets the in-memory status indicator for the given screenId to StatusIndicatorLevel_None and adds it to the ModelUpdate
+func ResetStatusIndicator_Update(update *scbus.ModelUpdatePacketType, screenId string) error {
+	// We do not need to set context when resetting the status indicator because we will not need to call the DB
+	return SetStatusIndicatorLevel_Update(context.TODO(), update, screenId, StatusIndicatorLevel_None, true)
+}
+
+// Resets the in-memory status indicator for the given screenId to StatusIndicatorLevel_None and pushes the new value to the FE
+func ResetStatusIndicator(screenId string) error {
+	// We do not need to set context when resetting the status indicator because we will not need to call the DB
+	return SetStatusIndicatorLevel(context.TODO(), screenId, StatusIndicatorLevel_None, true)
+}
+
+func IncrementNumRunningCmds_Update(update *scbus.ModelUpdatePacketType, screenId string, delta int) {
+	newNum := ScreenMemIncrementNumRunningCommands(screenId, delta)
+	update.AddUpdate(ScreenNumRunningCommandsType{
+		ScreenId: screenId,
+		Num:      newNum,
+	})
+
+}
+
+func IncrementNumRunningCmds(screenId string, delta int) {
+	update := scbus.MakeUpdatePacket()
+	IncrementNumRunningCmds_Update(update, screenId, delta)
+	scbus.MainUpdateBus.DoUpdate(update)
 }

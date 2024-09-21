@@ -3,8 +3,7 @@
 
 import dayjs from "dayjs";
 import localizedFormat from "dayjs/plugin/localizedFormat";
-import { isBlank, getDateStr } from "../../util/util";
-import { LineType, WebLine, RendererContext } from "../../types/types";
+import { isBlank, getDateStr } from "@/util/util";
 
 dayjs.extend(localizedFormat);
 
@@ -54,6 +53,18 @@ function isMultiLineCmdText(cmdText: string): boolean {
     return nlIdx != -1;
 }
 
+function countCmdLines(cmdText: string): number {
+    if (cmdText == null) {
+        return 1;
+    }
+    cmdText = cmdText.trim();
+    let nlIdx = cmdText.indexOf("\n");
+    if (nlIdx == -1) {
+        return 1;
+    }
+    return cmdText.split("\n").length;
+}
+
 function getFullCmdText(cmdText: string) {
     if (cmdText == null) {
         return "(none)";
@@ -99,6 +110,7 @@ export {
     getLineDateStr,
     getLineDateTimeStr,
     isMultiLineCmdText,
+    countCmdLines,
     getFullCmdText,
     getSingleLineCmdText,
     getRendererContext,

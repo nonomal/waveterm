@@ -17,18 +17,19 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/mattn/go-sqlite3"
-	sh2db "github.com/wavetermdev/waveterm/wavesrv/db"
+	dbfs "github.com/wavetermdev/waveterm/wavesrv/db"
 
 	"github.com/golang-migrate/migrate/v4"
 )
 
-const MaxMigration = 24
+const MaxMigration = 31
 const MigratePrimaryScreenVersion = 9
 const CmdScreenSpecialMigration = 13
 const CmdLineSpecialMigration = 20
+const RISpecialMigration = 30
 
 func MakeMigrate() (*migrate.Migrate, error) {
-	fsVar, err := iofs.New(sh2db.MigrationFS, "migrations")
+	fsVar, err := iofs.New(dbfs.MigrationFS, "migrations")
 	if err != nil {
 		return nil, fmt.Errorf("opening iofs: %w", err)
 	}
@@ -51,12 +52,12 @@ func copyFile(srcFile string, dstFile string, notFoundOk bool) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("cannot open %s: %v", err)
+		return fmt.Errorf("cannot open %s: %v", srcFile, err)
 	}
 	defer srcFd.Close()
 	dstFd, err := os.OpenFile(dstFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return fmt.Errorf("cannot open destination file %s: %v", err)
+		return fmt.Errorf("cannot open destination file %s: %v", dstFile, err)
 	}
 	_, err = io.Copy(dstFd, srcFd)
 	if err != nil {
@@ -80,6 +81,12 @@ func MigrateUpStep(m *migrate.Migrate, newVersion uint) error {
 	}
 	if newVersion == CmdLineSpecialMigration {
 		mErr := RunMigration20()
+		if mErr != nil {
+			return fmt.Errorf("migrating to v%d: %w", newVersion, mErr)
+		}
+	}
+	if newVersion == RISpecialMigration {
+		mErr := RunMigration30()
 		if mErr != nil {
 			return fmt.Errorf("migrating to v%d: %w", newVersion, mErr)
 		}

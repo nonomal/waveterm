@@ -1,0 +1,28 @@
+.wave-status-container {
+    display: flex;
+    align-items: center;
+
+    .dot {
+        height: 6px;
+        width: 6px;
+        border-radius: 50%;
+        display: inline-block;
+        margin-right: 8px;
+    }
+
+    .dot.green {
+        background-color: var(--app-success-color);
+    }
+
+    .dot.red {
+        background-color: var(--app-error-color);
+    }
+
+    .dot.gray {
+        background-color: var(--app-idle-color);
+    }
+
+    .dot.yellow {
+        background-color: var(--app-warning-color);
+    }
+}

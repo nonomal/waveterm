@@ -4,46 +4,51 @@
 import * as React from "react";
 import * as mobxReact from "mobx-react";
 import * as mobx from "mobx";
+import { clsx } from "clsx";
+
 import { boundMethod } from "autobind-decorator";
 import { If } from "tsx-control-statements/components";
-import dayjs from "dayjs";
-import type { ContextMenuOpts } from "../types/types";
-import localizedFormat from "dayjs/plugin/localizedFormat";
-import { GlobalModel } from "../model/model";
-import { isBlank } from "../util/util";
+import { GlobalModel } from "@/models";
+import { isBlank } from "@/util/util";
 import { WorkspaceView } from "./workspace/workspaceview";
 import { PluginsView } from "./pluginsview/pluginsview";
 import { BookmarksView } from "./bookmarks/bookmarks";
 import { HistoryView } from "./history/history";
 import { ConnectionsView } from "./connections/connections";
-import {
-    ScreenSettingsModal,
-    SessionSettingsModal,
-    LineSettingsModal,
-    ClientSettingsModal,
-} from "./common/modals/settings";
-import { MainSideBar } from "./sidebar/sidebar";
-import { DisconnectedModal, ClientStopModal, ModalsProvider } from "./common/modals/modals";
-import { ErrorBoundary } from "./common/error/errorboundary";
+import { ClientSettingsView } from "./clientsettings/clientsettings";
+import { MainSideBar } from "./sidebar/main";
+import { RightSideBar } from "./sidebar/right";
+import { DisconnectedModal, ClientStopModal } from "@/modals";
+import { ModalsProvider } from "@/modals/provider";
+import { Button } from "@/elements";
+import { ErrorBoundary } from "@/common/error/errorboundary";
+import { TermStyleList } from "@/elements";
+
 import "./app.less";
-
-dayjs.extend(localizedFormat);
-
-type OV<V> = mobx.IObservableValue<V>;
 
 @mobxReact.observer
 class App extends React.Component<{}, {}> {
     dcWait: OV<boolean> = mobx.observable.box(false, { name: "dcWait" });
+    mainContentRef: React.RefObject<HTMLDivElement> = React.createRef();
+    termThemesLoaded: OV<boolean> = mobx.observable.box(false, { name: "termThemesLoaded" });
+    chatFocusTimeoutId: NodeJS.Timeout = null;
 
-    constructor(props: any) {
+    constructor(props: {}) {
         super(props);
-        if (GlobalModel.isDev) document.body.className = "is-dev";
+        if (GlobalModel.isDev) document.body.classList.add("is-dev");
+    }
+
+    componentWillUnmount() {
+        if (this.chatFocusTimeoutId) {
+            clearTimeout(this.chatFocusTimeoutId);
+            this.chatFocusTimeoutId = null;
+        }
     }
 
     @boundMethod
     handleContextMenu(e: any) {
         let isInNonTermInput = false;
-        let activeElem = document.activeElement;
+        const activeElem = document.activeElement;
         if (activeElem != null && activeElem.nodeName == "TEXTAREA") {
             if (!activeElem.classList.contains("xterm-helper-textarea")) {
                 isInNonTermInput = true;
@@ -52,17 +57,13 @@ class App extends React.Component<{}, {}> {
         if (activeElem != null && activeElem.nodeName == "INPUT" && activeElem.getAttribute("type") == "text") {
             isInNonTermInput = true;
         }
-        let opts: ContextMenuOpts = {};
+        const opts: ContextMenuOpts = {};
         if (isInNonTermInput) {
             opts.showCut = true;
         }
-        let sel = window.getSelection();
-        if (!isBlank(sel?.toString())) {
+        const sel = window.getSelection();
+        if (!isBlank(sel?.toString()) || isInNonTermInput) {
             GlobalModel.contextEditMenu(e, opts);
-        } else {
-            if (isInNonTermInput) {
-                GlobalModel.contextEditMenu(e, opts);
-            }
         }
     }
 
@@ -73,13 +74,40 @@ class App extends React.Component<{}, {}> {
         })();
     }
 
+    @boundMethod
+    openMainSidebar() {
+        GlobalModel.mainSidebarModel.setCollapsed(false);
+    }
+
+    @boundMethod
+    openRightSidebar() {
+        GlobalModel.rightSidebarModel.setCollapsed(false);
+        this.chatFocusTimeoutId = setTimeout(() => {
+            GlobalModel.inputModel.setChatSidebarFocus();
+        }, 100);
+    }
+
+    @boundMethod
+    handleTermThemesRendered() {
+        mobx.action(() => {
+            this.termThemesLoaded.set(true);
+        })();
+    }
+
     render() {
-        let clientSettingsModal = GlobalModel.clientSettingsModal.get();
-        let remotesModel = GlobalModel.remotesModel;
-        let disconnected = !GlobalModel.ws.open.get() || !GlobalModel.waveSrvRunning.get();
-        let hasClientStop = GlobalModel.getHasClientStop();
-        let dcWait = this.dcWait.get();
-        let platform = GlobalModel.getPlatform();
+        const remotesModel = GlobalModel.remotesModel;
+        const disconnected = !GlobalModel.ws.open.get() || !GlobalModel.waveSrvRunning.get();
+        const hasClientStop = GlobalModel.getHasClientStop();
+        const dcWait = this.dcWait.get();
+        const platform = GlobalModel.getPlatform();
+        const clientData = GlobalModel.clientData.get();
+
+        // Previously, this is done in sidebar.tsx but it causes flicker when clientData is null cos screen-view shifts around.
+        // Doing it here fixes the flicker cos app is not rendered until clientData is populated.
+        // wait for termThemes as well (this actually means that the "connect" packet has been received)
+        if (clientData == null || GlobalModel.termThemes.get() == null) {
+            return null;
+        }
 
         if (disconnected || hasClientStop) {
             if (!dcWait) {
@@ -87,8 +115,8 @@ class App extends React.Component<{}, {}> {
             }
             return (
                 <div id="main" className={"platform-" + platform} onContextMenu={this.handleContextMenu}>
-                    <div className="main-content">
-                        <MainSideBar />
+                    <div ref={this.mainContentRef} className="main-content">
+                        <MainSideBar parentRef={this.mainContentRef} />
                         <div className="session-view" />
                     </div>
                     <If condition={dcWait}>
@@ -105,20 +133,65 @@ class App extends React.Component<{}, {}> {
         if (dcWait) {
             setTimeout(() => this.updateDcWait(false), 0);
         }
+
+        // used to force a full reload of the application
+        const renderVersion = GlobalModel.renderVersion.get();
+        const mainSidebarCollapsed = GlobalModel.mainSidebarModel.getCollapsed();
+        const rightSidebarCollapsed = GlobalModel.rightSidebarModel.getCollapsed();
+        const activeMainView = GlobalModel.activeMainView.get();
+        const lightDarkClass = GlobalModel.isDarkTheme.get() ? "is-dark" : "is-light";
+        const mainClassName = clsx(
+            "platform-" + platform,
+            {
+                "mainsidebar-collapsed": mainSidebarCollapsed,
+                "rightsidebar-collapsed": rightSidebarCollapsed,
+            },
+            lightDarkClass
+        );
         return (
-            <div id="main" className={"platform-" + platform} onContextMenu={this.handleContextMenu}>
-                <div className="main-content">
-                    <MainSideBar />
-                    <ErrorBoundary>
-                        <PluginsView />
-                        <WorkspaceView />
-                        <HistoryView />
-                        <BookmarksView />
-                        <ConnectionsView model={remotesModel} />
-                    </ErrorBoundary>
+            <>
+                <TermStyleList onRendered={this.handleTermThemesRendered} />
+                <div
+                    key={`version- + ${renderVersion}`}
+                    id="main"
+                    className={mainClassName}
+                    onContextMenu={this.handleContextMenu}
+                >
+                    <If condition={this.termThemesLoaded.get()}>
+                        <If condition={mainSidebarCollapsed}>
+                            <div key="logo-button" className="logo-button-container">
+                                <div className="logo-button-spacer" />
+                                <div className="logo-button" onClick={this.openMainSidebar}>
+                                    <img src="public/logos/wave-logo.png" alt="logo" />
+                                </div>
+                            </div>
+                        </If>
+                        <If condition={rightSidebarCollapsed && activeMainView == "session"}>
+                            <div className="right-sidebar-triggers" title="Open Wave AI (Cmd-Shift-Space)">
+                                <Button
+                                    className="secondary ghost right-sidebar-trigger"
+                                    onClick={this.openRightSidebar}
+                                >
+                                    <i className="fa-sharp fa-regular fa-sparkles"></i>
+                                </Button>
+                            </div>
+                        </If>
+                        <div ref={this.mainContentRef} className="main-content">
+                            <MainSideBar parentRef={this.mainContentRef} />
+                            <ErrorBoundary>
+                                <PluginsView />
+                                <WorkspaceView />
+                                <HistoryView />
+                                <BookmarksView />
+                                <ConnectionsView model={remotesModel} />
+                                <ClientSettingsView model={remotesModel} />
+                            </ErrorBoundary>
+                            <RightSideBar parentRef={this.mainContentRef} />
+                        </div>
+                        <ModalsProvider />
+                    </If>
                 </div>
-                <ModalsProvider />
-            </div>
+            </>
         );
     }
 }

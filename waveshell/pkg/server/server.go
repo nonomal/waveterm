@@ -20,13 +20,28 @@ import (
 	"github.com/alessio/shellescape"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/base"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/packet"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/shellapi"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/shexec"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/utilfn"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/wlog"
 )
 
 const MaxFileDataPacketSize = 16 * 1024
 const WriteFileContextTimeout = 30 * time.Second
 const cleanLoopTime = 5 * time.Second
 const MaxWriteFileContextData = 100
+const InboundRpcErrorTimeoutTime = 30 * time.Second
+
+type shellStateMapKey struct {
+	ShellType string
+	Hash      string
+}
+
+type ShellStateMap struct {
+	Lock            *sync.Mutex
+	StateMap        map[shellStateMapKey]*packet.ShellState // shelltype+hash -> state
+	CurrentStateMap map[string]string                       // shelltype -> hash
+}
 
 // TODO create unblockable packet-sender (backed by an array) for clientproc
 type MServer struct {
@@ -35,12 +50,91 @@ type MServer struct {
 	Sender              *packet.PacketSender
 	ClientMap           map[base.CommandKey]*shexec.ClientProc
 	Debug               bool
-	StateMap            map[string]*packet.ShellState // sha1->state
-	CurrentState        string                        // sha1
-	WriteErrorCh        chan bool                     // closed if there is a I/O write error
+	WriteErrorCh        chan bool // closed if there is a I/O write error
 	WriteErrorChOnce    *sync.Once
-	WriteFileContextMap map[string]*WriteFileContext
 	Done                bool
+	InboundRpcHandlers  map[string]RpcHandler
+	InboundRpcErrorSent map[string]time.Time // limits the amount of error messages sent back to the client
+}
+
+var _ RpcHandler = (*WriteFileContext)(nil)
+
+type RpcHandler interface {
+	GetTimeoutTime() time.Time
+	DispatchPacket(reqId string, pk packet.RpcFollowUpPacketType)
+	UnRegisterCallback()
+}
+
+func (m *MServer) registerRpcHandler(reqId string, handler RpcHandler) error {
+	if handler == nil {
+		return errors.New("handler is nil")
+	}
+	m.Lock.Lock()
+	defer m.Lock.Unlock()
+	if m.InboundRpcHandlers[reqId] != nil {
+		return errors.New("handler already registered")
+	}
+	delete(m.InboundRpcErrorSent, reqId)
+	m.InboundRpcHandlers[reqId] = handler
+	return nil
+}
+
+func (m *MServer) unregisterRpcHandler(reqId string) {
+	m.Lock.Lock()
+	defer m.Lock.Unlock()
+	handler := m.InboundRpcHandlers[reqId]
+	delete(m.InboundRpcHandlers, reqId)
+	if handler != nil {
+		handler.UnRegisterCallback()
+	}
+}
+
+// limits the number of error responses that can be sent
+func (m *MServer) sendInboundRpcError(reqId string, err error) {
+	m.Lock.Lock()
+	defer m.Lock.Unlock()
+	if _, ok := m.InboundRpcErrorSent[reqId]; ok {
+		return
+	}
+	m.InboundRpcErrorSent[reqId] = time.Now().Add(InboundRpcErrorTimeoutTime)
+	m.Sender.SendErrorResponse(reqId, err)
+}
+
+// returns true if dispatched to a waiting RPC handler
+func (m *MServer) dispatchRpcFollowUp(pk packet.RpcFollowUpPacketType) bool {
+	if pk == nil {
+		return true
+	}
+	reqId := pk.GetAssociatedReqId()
+	m.Lock.Lock()
+	defer m.Lock.Unlock()
+	if rh := m.InboundRpcHandlers[reqId]; rh != nil {
+		rh.DispatchPacket(reqId, pk)
+		return true
+	}
+	return false
+}
+
+func (m *MServer) cleanRpcHandlers() {
+	var staleHandlers []RpcHandler
+	now := time.Now()
+	m.Lock.Lock()
+	for reqId, rh := range m.InboundRpcHandlers {
+		if now.After(rh.GetTimeoutTime()) {
+			staleHandlers = append(staleHandlers, rh)
+			delete(m.InboundRpcHandlers, reqId)
+		}
+	}
+	for reqId, timeoutTime := range m.InboundRpcErrorSent {
+		if now.After(timeoutTime) {
+			delete(m.InboundRpcErrorSent, reqId)
+		}
+	}
+	m.Lock.Unlock()
+	// we do this outside of m.Lock just in case there is some lock contention (UnRegisterCallback might be slow)
+	for _, rh := range staleHandlers {
+		rh.UnRegisterCallback()
+	}
 }
 
 type WriteFileContext struct {
@@ -65,25 +159,13 @@ func (m *MServer) checkDone() bool {
 	return m.Done
 }
 
-func (m *MServer) getWriteFileContext(reqId string) *WriteFileContext {
-	m.Lock.Lock()
-	defer m.Lock.Unlock()
-	wfc := m.WriteFileContextMap[reqId]
-	if wfc == nil {
-		wfc = &WriteFileContext{
-			CVar:       sync.NewCond(&sync.Mutex{}),
-			LastActive: time.Now(),
-		}
-		m.WriteFileContextMap[reqId] = wfc
-	}
-	return wfc
+func (wfc *WriteFileContext) GetTimeoutTime() time.Time {
+	return wfc.LastActive.Add(WriteFileContextTimeout)
 }
 
-func (m *MServer) addFileDataPacket(pk *packet.FileDataPacketType) {
-	m.Lock.Lock()
-	wfc := m.WriteFileContextMap[pk.RespId]
-	m.Lock.Unlock()
-	if wfc == nil {
+func (wfc *WriteFileContext) DispatchPacket(reqId string, pkArg packet.RpcFollowUpPacketType) {
+	dataPk, ok := pkArg.(*packet.FileDataPacketType)
+	if !ok {
 		return
 	}
 	wfc.CVar.L.Lock()
@@ -98,34 +180,16 @@ func (m *MServer) addFileDataPacket(pk *packet.FileDataPacketType) {
 		return
 	}
 	wfc.LastActive = time.Now()
-	wfc.Data = append(wfc.Data, pk)
+	wfc.Data = append(wfc.Data, dataPk)
 	wfc.CVar.Signal()
 }
 
-func (wfc *WriteFileContext) setDone() {
+func (wfc *WriteFileContext) UnRegisterCallback() {
 	wfc.CVar.L.Lock()
 	defer wfc.CVar.L.Unlock()
 	wfc.Done = true
 	wfc.Data = nil
 	wfc.CVar.Broadcast()
-}
-
-func (m *MServer) cleanWriteFileContexts() {
-	now := time.Now()
-	var staleWfcs []*WriteFileContext
-	m.Lock.Lock()
-	for reqId, wfc := range m.WriteFileContextMap {
-		if now.Sub(wfc.LastActive) > WriteFileContextTimeout {
-			staleWfcs = append(staleWfcs, wfc)
-			delete(m.WriteFileContextMap, reqId)
-		}
-	}
-	m.Lock.Unlock()
-
-	// we do this outside of m.Lock just in case there is some lock contention (end of WriteFile could theoretically be slow)
-	for _, wfc := range staleWfcs {
-		wfc.setDone()
-	}
 }
 
 func (m *MServer) ProcessCommandPacket(pk packet.CommandPacketType) {
@@ -138,19 +202,22 @@ func (m *MServer) ProcessCommandPacket(pk packet.CommandPacketType) {
 	cproc := m.ClientMap[ck]
 	m.Lock.Unlock()
 	if cproc == nil {
-		m.Sender.SendCmdError(ck, fmt.Errorf("no client proc for ck '%s', pk=%s", ck, packet.AsString(pk)))
+		wlog.Logf("no client proc for ck %q, pk=%s", ck, packet.AsString(pk))
 		return
 	}
 	cproc.Input.SendPacket(pk)
-	return
 }
 
 func runSingleCompGen(cwd string, compType string, prefix string) ([]string, bool, error) {
+	sapi, err := shellapi.MakeShellApi(packet.ShellType_bash)
+	if err != nil {
+		return nil, false, err
+	}
 	if !packet.IsValidCompGenType(compType) {
 		return nil, false, fmt.Errorf("invalid compgen type '%s'", compType)
 	}
 	compGenCmdStr := fmt.Sprintf("cd %s; compgen -A %s -- %s | sort | uniq | head -n %d", shellescape.Quote(cwd), shellescape.Quote(compType), shellescape.Quote(prefix), packet.MaxCompGenValues+1)
-	ecmd := exec.Command("bash", "-c", compGenCmdStr)
+	ecmd := exec.Command(sapi.GetLocalShellPath(), "-c", compGenCmdStr)
 	outputBytes, err := ecmd.Output()
 	if err != nil {
 		return nil, false, fmt.Errorf("compgen error: %w", err)
@@ -209,7 +276,6 @@ func (m *MServer) runMixedCompGen(compPk *packet.CompGenPacketType) {
 	}
 	sort.Strings(comps) // resort
 	m.Sender.SendResponse(reqId, map[string]interface{}{"comps": comps, "hasmore": (hasMoreFiles || hasMoreDirs)})
-	return
 }
 
 func (m *MServer) runCompGen(compPk *packet.CompGenPacketType) {
@@ -227,29 +293,80 @@ func (m *MServer) runCompGen(compPk *packet.CompGenPacketType) {
 		appendSlashes(comps)
 	}
 	m.Sender.SendResponse(reqId, map[string]interface{}{"comps": comps, "hasmore": hasMore})
-	return
 }
 
-func (m *MServer) setCurrentState(state *packet.ShellState) {
-	if state == nil {
+type ReinitRpcHandler struct {
+	ReqId       string
+	TimeoutTime time.Time
+	StdinDataCh chan []byte
+}
+
+func (rh *ReinitRpcHandler) GetTimeoutTime() time.Time {
+	return rh.TimeoutTime
+}
+
+func (rh *ReinitRpcHandler) DispatchPacket(reqId string, pkArg packet.RpcFollowUpPacketType) {
+	rpcInput, ok := pkArg.(*packet.RpcInputPacketType)
+	if !ok {
+		wlog.Logf("reinit rpc handler: invalid packet type: %T", pkArg)
 		return
 	}
-	hval, _ := state.EncodeAndHash()
-	m.Lock.Lock()
-	defer m.Lock.Unlock()
-	m.StateMap[hval] = state
-	m.CurrentState = hval
+	// nonblocking send
+	select {
+	case rh.StdinDataCh <- rpcInput.Data:
+	default:
+		wlog.Logf("reinit rpc handler: stdin data channel full, dropping data")
+	}
 }
 
-func (m *MServer) reinit(reqId string) {
-	initPk, err := shexec.MakeServerInitPacket()
+func (rh *ReinitRpcHandler) UnRegisterCallback() {
+	close(rh.StdinDataCh)
+}
+
+func (m *MServer) reinit(reqId string, shellType string) {
+	stdinDataCh := make(chan []byte, 10)
+	rh := &ReinitRpcHandler{
+		ReqId:       reqId,
+		TimeoutTime: time.Now().Add(30 * time.Second),
+		StdinDataCh: stdinDataCh,
+	}
+	m.registerRpcHandler(reqId, rh)
+	defer m.unregisterRpcHandler(reqId)
+	ssPk, err := m.MakeShellStatePacket(reqId, shellType, stdinDataCh)
 	if err != nil {
-		m.Sender.SendErrorResponse(reqId, fmt.Errorf("error creating init packet: %w", err))
+		m.Sender.SendErrorResponse(reqId, fmt.Errorf("error initializing shell: %w", err))
 		return
 	}
-	m.setCurrentState(initPk.State)
-	initPk.RespId = reqId
-	m.Sender.SendPacket(initPk)
+	ssPk.RespId = reqId
+	m.Sender.SendPacket(ssPk)
+}
+
+func (m *MServer) MakeShellStatePacket(reqId string, shellType string, stdinDataCh chan []byte) (*packet.ShellStatePacketType, error) {
+	sapi, err := shellapi.MakeShellApi(shellType)
+	if err != nil {
+		return nil, err
+	}
+	rtnCh := make(chan shellapi.ShellStateOutput, 1)
+	ctx, cancelFn := context.WithCancel(context.Background())
+	defer cancelFn()
+	go sapi.GetShellState(ctx, rtnCh, stdinDataCh)
+	for ssOutput := range rtnCh {
+		if ssOutput.Error != "" {
+			return nil, errors.New(ssOutput.Error)
+		}
+		if ssOutput.ShellState != nil {
+			rtn := packet.MakeShellStatePacket()
+			rtn.State = ssOutput.ShellState
+			rtn.Stats = ssOutput.Stats
+			return rtn, nil
+		}
+		if ssOutput.Output != nil {
+			dataPk := packet.MakeFileDataPacket(reqId)
+			dataPk.Data = ssOutput.Output
+			m.Sender.SendPacket(dataPk)
+		}
+	}
+	return nil, nil
 }
 
 func makeTemp(path string, mode fs.FileMode) (*os.File, error) {
@@ -322,7 +439,7 @@ func copyFile(dstName string, srcName string) error {
 }
 
 func (m *MServer) writeFile(pk *packet.WriteFilePacketType, wfc *WriteFileContext) {
-	defer wfc.setDone()
+	defer m.unregisterRpcHandler(pk.ReqId)
 	if pk.Path == "" {
 		resp := packet.MakeWriteFileReadyPacket(pk.ReqId)
 		resp.Error = "invalid write-file request, no path specified"
@@ -338,7 +455,7 @@ func (m *MServer) writeFile(pk *packet.WriteFilePacketType, wfc *WriteFileContex
 	}
 	var writeFd *os.File
 	if pk.UseTemp {
-		writeFd, err = os.CreateTemp("", "mshell.writefile.*") // "" means make this file in standard TempDir
+		writeFd, err = os.CreateTemp("", "waveshell.writefile.*") // "" means make this file in standard TempDir
 		if err != nil {
 			resp := packet.MakeWriteFileReadyPacket(pk.ReqId)
 			resp.Error = fmt.Sprintf("cannot create temp file: %v", err)
@@ -443,7 +560,6 @@ func (m *MServer) returnStreamFileNewFileResponse(pk *packet.StreamFilePacketTyp
 		Perm:     int(dirInfo.Mode().Perm()),
 		NotFound: true,
 	}
-	return
 }
 
 func (m *MServer) streamFile(pk *packet.StreamFilePacketType) {
@@ -459,12 +575,14 @@ func (m *MServer) streamFile(pk *packet.StreamFilePacketType) {
 		m.Sender.SendPacket(resp)
 		return
 	}
+	mimeType := utilfn.DetectMimeType(pk.Path)
 	resp.Info = &packet.FileInfo{
-		Name:  pk.Path,
-		Size:  finfo.Size(),
-		ModTs: finfo.ModTime().UnixMilli(),
-		IsDir: finfo.IsDir(),
-		Perm:  int(finfo.Mode().Perm()),
+		Name:     pk.Path,
+		Size:     finfo.Size(),
+		ModTs:    finfo.ModTime().UnixMilli(),
+		IsDir:    finfo.IsDir(),
+		MimeType: mimeType,
+		Perm:     int(finfo.Mode().Perm()),
 	}
 	if pk.StatOnly {
 		resp.Done = true
@@ -564,8 +682,8 @@ func (m *MServer) ProcessRpcPacket(pk packet.RpcPacketType) {
 		go m.runCompGen(compPk)
 		return
 	}
-	if _, ok := pk.(*packet.ReInitPacketType); ok {
-		go m.reinit(reqId)
+	if reinitPk, ok := pk.(*packet.ReInitPacketType); ok {
+		go m.reinit(reqId, reinitPk.ShellType)
 		return
 	}
 	if streamPk, ok := pk.(*packet.StreamFilePacketType); ok {
@@ -573,21 +691,22 @@ func (m *MServer) ProcessRpcPacket(pk packet.RpcPacketType) {
 		return
 	}
 	if writePk, ok := pk.(*packet.WriteFilePacketType); ok {
-		wfc := m.getWriteFileContext(writePk.ReqId)
+		wfc := &WriteFileContext{
+			CVar:       sync.NewCond(&sync.Mutex{}),
+			LastActive: time.Now(),
+		}
+		err := m.registerRpcHandler(writePk.ReqId, wfc)
+		if err != nil {
+			m.Sender.SendErrorResponse(reqId, fmt.Errorf("error registering write-file handler: %w", err))
+			return
+		}
 		go m.writeFile(writePk, wfc)
 		return
 	}
 	m.Sender.SendErrorResponse(reqId, fmt.Errorf("invalid rpc type '%s'", pk.GetType()))
-	return
 }
 
-func (m *MServer) getCurrentState() (string, *packet.ShellState) {
-	m.Lock.Lock()
-	defer m.Lock.Unlock()
-	return m.CurrentState, m.StateMap[m.CurrentState]
-}
-
-func (m *MServer) clientPacketCallback(pk packet.PacketType) {
+func (m *MServer) clientPacketCallback(shellType string, pk packet.PacketType, runPk *packet.RunPacketType) {
 	if pk.GetType() != packet.CmdDonePacketStr {
 		return
 	}
@@ -595,16 +714,22 @@ func (m *MServer) clientPacketCallback(pk packet.PacketType) {
 	if donePk.FinalState == nil {
 		return
 	}
-	stateHash, curState := m.getCurrentState()
-	if curState == nil {
+	initialState := runPk.State
+	if initialState == nil {
 		return
 	}
-	diff, err := shexec.MakeShellStateDiff(*curState, stateHash, *donePk.FinalState)
+	initialStateHash := initialState.GetHashVal(false)
+	sapi, err := shellapi.MakeShellApi(initialState.GetShellType())
+	if err != nil {
+		return
+	}
+	diff, err := sapi.MakeShellStateDiff(initialState, initialStateHash, donePk.FinalState)
 	if err != nil {
 		return
 	}
 	donePk.FinalState = nil
-	donePk.FinalStateDiff = &diff
+	donePk.FinalStateDiff = diff
+	donePk.FinalStateBasePtr = runPk.StatePtr
 }
 
 func (m *MServer) runCommand(runPacket *packet.RunPacketType) {
@@ -612,14 +737,31 @@ func (m *MServer) runCommand(runPacket *packet.RunPacketType) {
 		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("server run packets require valid ck: %s", err))
 		return
 	}
-	ecmd, err := shexec.SSHOpts{}.MakeMShellSingleCmd(true)
+	if runPacket.ShellType == "" {
+		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("server run packets require shell type"))
+		return
+	}
+	if runPacket.State == nil {
+		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("server run packets require state"))
+		return
+	}
+	_, _, err := packet.ParseShellStateVersion(runPacket.State.Version)
+	if err != nil {
+		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("invalid shellstate version: %w", err))
+		return
+	}
+	if runPacket.Command == "wave:testerror" {
+		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("test error"))
+		return
+	}
+	ecmd, err := shexec.MakeWaveshellSingleCmd()
 	if err != nil {
 		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("server run packets require valid ck: %s", err))
 		return
 	}
-	cproc, _, err := shexec.MakeClientProc(context.Background(), ecmd)
+	cproc, err := shexec.MakeClientProc(context.Background(), shexec.CmdWrap{Cmd: ecmd})
 	if err != nil {
-		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("starting mshell client: %s", err))
+		m.Sender.SendErrorResponse(runPacket.ReqId, fmt.Errorf("starting waveshell client: %s", err))
 		return
 	}
 	m.Lock.Lock()
@@ -640,7 +782,9 @@ func (m *MServer) runCommand(runPacket *packet.RunPacketType) {
 			cproc.Close()
 		}()
 		shexec.SendRunPacketAndRunData(context.Background(), cproc.Input, runPacket)
-		cproc.ProxySingleOutput(runPacket.CK, m.Sender, m.clientPacketCallback)
+		cproc.ProxySingleOutput(runPacket.CK, m.Sender, func(pk packet.PacketType) {
+			m.clientPacketCallback(runPacket.ShellType, pk, runPacket)
+		})
 	}()
 }
 
@@ -664,7 +808,7 @@ func (server *MServer) runReadLoop() {
 	builder := packet.MakeRunPacketBuilder()
 	for pk := range server.MainInput.MainCh {
 		if server.Debug {
-			fmt.Printf("PK> %s\n", packet.AsString(pk))
+			wlog.Logf("runReadLoop got packet %s\n", packet.AsString(pk))
 		}
 		ok, runPacket := builder.ProcessPacket(pk)
 		if ok {
@@ -674,19 +818,22 @@ func (server *MServer) runReadLoop() {
 			}
 			continue
 		}
-		if cmdPk, ok := pk.(packet.CommandPacketType); ok {
+		if cmdPk, ok := pk.(packet.CommandPacketType); ok && cmdPk.GetCK() != "" {
 			server.ProcessCommandPacket(cmdPk)
 			continue
 		}
-		if rpcPk, ok := pk.(packet.RpcPacketType); ok {
+		if rpcPk, ok := pk.(packet.RpcPacketType); ok && rpcPk.GetReqId() != "" {
 			server.ProcessRpcPacket(rpcPk)
 			continue
 		}
-		if fileDataPk, ok := pk.(*packet.FileDataPacketType); ok {
-			server.addFileDataPacket(fileDataPk)
+		if rpcFollowUp, ok := pk.(packet.RpcFollowUpPacketType); ok && rpcFollowUp.GetAssociatedReqId() != "" {
+			ok := server.dispatchRpcFollowUp(rpcFollowUp)
+			if !ok {
+				server.sendInboundRpcError(rpcFollowUp.GetAssociatedReqId(), fmt.Errorf("no handler for rpc follow-up packet"))
+			}
 			continue
 		}
-		server.Sender.SendMessageFmt("invalid packet '%s' sent to mshell server", packet.AsString(pk))
+		server.Sender.SendMessageFmt("invalid packet '%s' sent to waveshell server", packet.AsString(pk))
 		continue
 	}
 }
@@ -699,33 +846,33 @@ func RunServer() (int, error) {
 	server := &MServer{
 		Lock:                &sync.Mutex{},
 		ClientMap:           make(map[base.CommandKey]*shexec.ClientProc),
-		StateMap:            make(map[string]*packet.ShellState),
 		Debug:               debug,
 		WriteErrorCh:        make(chan bool),
 		WriteErrorChOnce:    &sync.Once{},
-		WriteFileContextMap: make(map[string]*WriteFileContext),
+		InboundRpcHandlers:  make(map[string]RpcHandler),
+		InboundRpcErrorSent: make(map[string]time.Time),
 	}
+	if debug {
+		packet.GlobalDebug = true
+	}
+	server.MainInput = packet.MakePacketParser(os.Stdin, nil)
+	server.Sender = packet.MakePacketSender(os.Stdout, server.packetSenderErrorHandler)
+	defer server.Close()
+	wlog.LogConsumer = server.Sender.SendLogPacket
 	go func() {
 		for {
 			if server.checkDone() {
 				return
 			}
 			time.Sleep(cleanLoopTime)
-			server.cleanWriteFileContexts()
+			server.cleanRpcHandlers()
 		}
 	}()
-	if debug {
-		packet.GlobalDebug = true
-	}
-	server.MainInput = packet.MakePacketParser(os.Stdin, false)
-	server.Sender = packet.MakePacketSender(os.Stdout, server.packetSenderErrorHandler)
-	defer server.Close()
 	var err error
 	initPacket, err := shexec.MakeServerInitPacket()
 	if err != nil {
 		return 1, err
 	}
-	server.setCurrentState(initPacket.State)
 	server.Sender.SendPacket(initPacket)
 	ticker := time.NewTicker(1 * time.Minute)
 	go func() {
@@ -747,4 +894,61 @@ func RunServer() (int, error) {
 		break
 	}
 	return 0, nil
+}
+
+func MakeShellStateMap() *ShellStateMap {
+	return &ShellStateMap{
+		Lock:            &sync.Mutex{},
+		StateMap:        make(map[shellStateMapKey]*packet.ShellState),
+		CurrentStateMap: make(map[string]string),
+	}
+}
+
+func (sm *ShellStateMap) GetCurrentState(shellType string) (string, *packet.ShellState) {
+	sm.Lock.Lock()
+	defer sm.Lock.Unlock()
+	hval := sm.CurrentStateMap[shellType]
+	return hval, sm.StateMap[shellStateMapKey{ShellType: shellType, Hash: hval}]
+}
+
+func (sm *ShellStateMap) SetCurrentState(shellType string, state *packet.ShellState) error {
+	if state == nil {
+		return fmt.Errorf("cannot set nil state")
+	}
+	if shellType != state.GetShellType() {
+		return fmt.Errorf("shell type mismatch: %s != %s", shellType, state.GetShellType())
+	}
+	sm.Lock.Lock()
+	defer sm.Lock.Unlock()
+	hval, _ := state.EncodeAndHash()
+	key := shellStateMapKey{ShellType: shellType, Hash: hval}
+	sm.StateMap[key] = state
+	sm.CurrentStateMap[shellType] = hval
+	return nil
+}
+
+func (sm *ShellStateMap) GetStateByHash(shellType string, hash string) *packet.ShellState {
+	sm.Lock.Lock()
+	defer sm.Lock.Unlock()
+	return sm.StateMap[shellStateMapKey{ShellType: shellType, Hash: hash}]
+}
+
+func (sm *ShellStateMap) Clear() {
+	sm.Lock.Lock()
+	defer sm.Lock.Unlock()
+	sm.StateMap = make(map[shellStateMapKey]*packet.ShellState)
+	sm.CurrentStateMap = make(map[string]string)
+}
+
+func (sm *ShellStateMap) GetShells() []string {
+	sm.Lock.Lock()
+	defer sm.Lock.Unlock()
+	return utilfn.GetMapKeys(sm.CurrentStateMap)
+}
+
+func (sm *ShellStateMap) HasShell(shellType string) bool {
+	sm.Lock.Lock()
+	defer sm.Lock.Unlock()
+	_, found := sm.CurrentStateMap[shellType]
+	return found
 }

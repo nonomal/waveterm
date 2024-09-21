@@ -6,21 +6,77 @@ import * as mobxReact from "mobx-react";
 import * as mobx from "mobx";
 import { boundMethod } from "autobind-decorator";
 import { If, For } from "tsx-control-statements/components";
-import cn from "classnames";
-import type { BookmarkType } from "../../types/types";
-import { GlobalModel } from "../../model/model";
-import { CmdStrCode, Markdown } from "../common/common";
+import { clsx } from "clsx";
+import { GlobalModel } from "@/models";
+import { CmdStrCode, Markdown } from "@/common/elements";
 
-import { ReactComponent as XmarkIcon } from "../assets/icons/line/xmark.svg";
-import { ReactComponent as CopyIcon } from "../assets/icons/favourites/copy.svg";
-import { ReactComponent as PenIcon } from "../assets/icons/favourites/pen.svg";
-import { ReactComponent as TrashIcon } from "../assets/icons/favourites/trash.svg";
-import { ReactComponent as FavoritesIcon } from "../assets/icons/favourites.svg";
+import { ReactComponent as CopyIcon } from "@/assets/icons/favourites/copy.svg";
+import { ReactComponent as PenIcon } from "@/assets/icons/favourites/pen.svg";
+import { ReactComponent as TrashIcon } from "@/assets/icons/favourites/trash.svg";
+import { ReactComponent as FavoritesIcon } from "@/assets/icons/favourites.svg";
 
 import "./bookmarks.less";
+import { MainView } from "../common/elements/mainview";
+
+type BookmarkProps = {
+    bookmark: BookmarkType;
+};
+
+class BookmarkKeybindings extends React.Component<{}, {}> {
+    @boundMethod
+    componentDidMount(): void {
+        let keybindManager = GlobalModel.keybindManager;
+        let bookmarksModel = GlobalModel.bookmarksModel;
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:cancel", (waveEvent) => {
+            bookmarksModel.handleUserClose();
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:deleteItem", (waveEvent) => {
+            bookmarksModel.handleUserDelete();
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:selectAbove", (waveEvent) => {
+            bookmarksModel.handleUserNavigate(-1);
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:selectBelow", (waveEvent) => {
+            bookmarksModel.handleUserNavigate(1);
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:selectPageAbove", (waveEvent) => {
+            bookmarksModel.handleUserNavigate(-10);
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:selectPageBelow", (waveEvent) => {
+            bookmarksModel.handleUserNavigate(10);
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "generic:confirm", (waveEvent) => {
+            bookmarksModel.handleUserConfirm();
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "bookmarks:edit", (waveEvent) => {
+            bookmarksModel.handleUserEdit();
+            return true;
+        });
+        keybindManager.registerKeybinding("mainview", "bookmarks", "bookmarks:copy", (waveEvent) => {
+            bookmarksModel.handleUserCopy();
+            return true;
+        });
+    }
+
+    @boundMethod
+    componentWillUnmount() {
+        GlobalModel.keybindManager.unregisterDomain("bookmarks");
+    }
+
+    render() {
+        return null;
+    }
+}
 
 @mobxReact.observer
-class Bookmark extends React.Component<{ bookmark: BookmarkType }, {}> {
+class Bookmark extends React.Component<BookmarkProps, {}> {
     @boundMethod
     handleDeleteClick(): void {
         let { bookmark } = this.props;
@@ -39,14 +95,12 @@ class Bookmark extends React.Component<{ bookmark: BookmarkType }, {}> {
     handleEditCancel(): void {
         let model = GlobalModel.bookmarksModel;
         model.cancelEdit();
-        return;
     }
 
     @boundMethod
     handleEditUpdate(): void {
         let model = GlobalModel.bookmarksModel;
         model.confirmEdit();
-        return;
     }
 
     @boundMethod
@@ -98,11 +152,11 @@ class Bookmark extends React.Component<{ bookmark: BookmarkType }, {}> {
             return (
                 <div
                     data-bookmarkid={bm.bookmarkid}
-                    className={cn("bookmark focus-parent is-editing", {
+                    className={clsx("bookmark focus-parent is-editing", {
                         "pending-delete": model.pendingDelete.get() == bm.bookmarkid,
                     })}
                 >
-                    <div className={cn("focus-indicator", { active: isSelected })} />
+                    <div className={clsx("focus-indicator", { active: isSelected })} />
                     <div className="bookmark-edit">
                         <div className="field">
                             <label className="label">Description (markdown)</label>
@@ -144,16 +198,16 @@ class Bookmark extends React.Component<{ bookmark: BookmarkType }, {}> {
         }
         return (
             <div
-                className={cn("bookmark focus-parent", {
+                className={clsx("bookmark focus-parent", {
                     "pending-delete": model.pendingDelete.get() == bm.bookmarkid,
                 })}
                 onClick={this.handleClick}
             >
-                <div className={cn("focus-indicator", { active: isSelected })} />
+                <div className={clsx("focus-indicator", { active: isSelected })} />
                 <div className="bookmark-id-div">{bm.bookmarkid.substr(0, 8)}</div>
                 <div className="bookmark-content">
                     <If condition={hasDesc}>
-                        <Markdown text={markdown} />
+                        <Markdown text={markdown} extraClassName="bottom-margin" />
                     </If>
                     <CmdStrCode
                         cmdstr={bm.cmdstr}
@@ -180,26 +234,22 @@ class Bookmark extends React.Component<{ bookmark: BookmarkType }, {}> {
 @mobxReact.observer
 class BookmarksView extends React.Component<{}, {}> {
     @boundMethod
-    closeView(): void {
+    handleClose() {
         GlobalModel.bookmarksModel.closeView();
     }
 
     render() {
-        let isHidden = GlobalModel.activeMainView.get() != "bookmarks";
+        const isHidden = GlobalModel.activeMainView.get() != "bookmarks";
         if (isHidden) {
             return null;
         }
         let bookmarks = GlobalModel.bookmarksModel.bookmarks;
-        let idx: number = 0;
         let bookmark: BookmarkType = null;
         return (
-            <div className={cn("bookmarks-view", { "is-hidden": isHidden })}>
-                <div className="header">
-                    <div className="bookmarks-title">Favorites</div>
-                    <div className="close-button hoverEffect" title="Close (Escape)" onClick={this.closeView}>
-                        <XmarkIcon className={"icon"} />
-                    </div>
-                </div>
+            <MainView className="bookmarks-view" title="Bookmarks" onClose={this.handleClose}>
+                <If condition={!isHidden}>
+                    <BookmarkKeybindings></BookmarkKeybindings>
+                </If>
                 <div className="bookmarks-list">
                     <For index="idx" each="bookmark" of={bookmarks}>
                         <Bookmark key={bookmark.bookmarkid} bookmark={bookmark} />
@@ -228,7 +278,7 @@ class BookmarksView extends React.Component<{}, {}> {
                         </div>
                     </div>
                 </If>
-            </div>
+            </MainView>
         );
     }
 }

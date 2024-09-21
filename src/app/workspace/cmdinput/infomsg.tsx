@@ -3,23 +3,32 @@
 
 import * as React from "react";
 import * as mobxReact from "mobx-react";
+import * as mobx from "mobx";
 import { If, For } from "tsx-control-statements/components";
-import cn from "classnames";
+import { clsx } from "clsx";
 import dayjs from "dayjs";
 import localizedFormat from "dayjs/plugin/localizedFormat";
-import { GlobalModel } from "../../../model/model";
-import { makeExternLink } from "../../../util/util";
+import { GlobalModel } from "@/models";
+import * as appconst from "@/app/appconst";
+import { AuxiliaryCmdView } from "./auxview";
+
+import "./infomsg.less";
 
 dayjs.extend(localizedFormat);
 
 @mobxReact.observer
 class InfoMsg extends React.Component<{}, {}> {
+    constructor(props) {
+        super(props);
+        mobx.makeObservable(this);
+    }
+
     getAfterSlash(s: string): string {
         if (s.startsWith("^/")) {
-            return s.substr(1);
+            return s.substring(1);
         }
         if (s.startsWith("^")) {
-            return s.substr(1);
+            return s.substring(1);
         }
         let slashIdx = s.lastIndexOf("/");
         if (slashIdx == s.length - 1) {
@@ -28,7 +37,7 @@ class InfoMsg extends React.Component<{}, {}> {
         if (slashIdx == -1) {
             return s;
         }
-        return s.substr(slashIdx + 1);
+        return s.substring(slashIdx + 1);
     }
 
     hasSpace(s: string): boolean {
@@ -40,27 +49,27 @@ class InfoMsg extends React.Component<{}, {}> {
     }
 
     render() {
-        let model = GlobalModel;
-        let inputModel = model.inputModel;
-        let infoMsg = inputModel.infoMsg.get();
-        let infoShow = inputModel.infoShow.get();
+        const inputModel = GlobalModel.inputModel;
+        const infoMsg: InfoType = inputModel.infoMsg.get();
+        const infoShow = inputModel.getActiveAuxView() == appconst.InputAuxView_Info;
         let line: string = null;
         let istr: string = null;
         let idx: number = 0;
         let titleStr = null;
-        let remoteEditKey = "inforemoteedit";
         if (infoMsg != null) {
             titleStr = infoMsg.infotitle;
         }
-        let activeScreen = model.getActiveScreen();
+        if (!infoShow) {
+            return null;
+        }
+
         return (
-            <div className="cmd-input-info" style={{ display: infoShow ? "block" : "none" }}>
-                <If condition={infoMsg && infoMsg.infotitle != null}>
-                    <div key="infotitle" className="info-title">
-                        {titleStr}
-                    </div>
-                </If>
-                <If condition={infoMsg && infoMsg.infomsg != null}>
+            <AuxiliaryCmdView
+                title={titleStr}
+                className="cmd-input-info"
+                onClose={() => GlobalModel.inputModel.closeAuxView()}
+            >
+                <If condition={infoMsg?.infomsg}>
                     <div key="infomsg" className="info-msg">
                         <If condition={infoMsg.infomsghtml}>
                             <span dangerouslySetInnerHTML={{ __html: infoMsg.infomsg }} />
@@ -68,28 +77,20 @@ class InfoMsg extends React.Component<{}, {}> {
                         <If condition={!infoMsg.infomsghtml}>{infoMsg.infomsg}</If>
                     </div>
                 </If>
-                <If condition={infoMsg && infoMsg.websharelink && activeScreen != null}>
-                    <div key="infomsg" className="info-msg">
-                        started sharing screen at{" "}
-                        <a target="_blank" href={makeExternLink(activeScreen.getWebShareUrl())}>
-                            [link]
-                        </a>
-                    </div>
-                </If>
-                <If condition={infoMsg && infoMsg.infolines != null}>
+                <If condition={infoMsg?.infolines}>
                     <div key="infolines" className="info-lines">
                         <For index="idx" each="line" of={infoMsg.infolines}>
                             <div key={idx}>{line == "" ? " " : line}</div>
                         </For>
                     </div>
                 </If>
-                <If condition={infoMsg && infoMsg.infocomps != null && infoMsg.infocomps.length > 0}>
+                <If condition={infoMsg?.infocomps?.length > 0}>
                     <div key="infocomps" className="info-comps">
                         <For each="istr" index="idx" of={infoMsg.infocomps}>
                             <div
                                 onClick={() => this.handleCompClick(istr)}
                                 key={idx}
-                                className={cn(
+                                className={clsx(
                                     "info-comp",
                                     { "has-space": this.hasSpace(istr) },
                                     { "metacmd-comp": istr.startsWith("^") }
@@ -105,12 +106,15 @@ class InfoMsg extends React.Component<{}, {}> {
                         </If>
                     </div>
                 </If>
-                <If condition={infoMsg && infoMsg.infoerror != null}>
+                <If condition={infoMsg?.infoerror}>
                     <div key="infoerror" className="info-error">
                         [error] {infoMsg.infoerror}
                     </div>
+                    <If condition={infoMsg.infoerrorcode == appconst.ErrorCode_InvalidCwd}>
+                        <div className="info-error">to reset, run: /reset:cwd</div>
+                    </If>
                 </If>
-            </div>
+            </AuxiliaryCmdView>
         );
     }
 }

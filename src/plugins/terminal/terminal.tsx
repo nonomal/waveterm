@@ -8,33 +8,79 @@ import { boundMethod } from "autobind-decorator";
 import dayjs from "dayjs";
 import localizedFormat from "dayjs/plugin/localizedFormat";
 import { If } from "tsx-control-statements/components";
-import { GlobalModel, LineContainerModel } from "../../model/model";
-import { termHeightFromRows } from "../../util/textmeasure";
-import type { LineType } from "../../types/types";
-import cn from "classnames";
-import * as lineutil from "../../app/line/lineutil";
+import { GlobalModel } from "@/models";
+import { termHeightFromRows } from "@/util/textmeasure";
+import { clsx } from "clsx";
+import * as lineutil from "@/app/line/lineutil";
 
 import "./terminal.less";
 
 dayjs.extend(localizedFormat);
 
-type OV<V> = mobx.IObservableValue<V>;
-type OArr<V> = mobx.IObservableArray<V>;
-type OMap<K, V> = mobx.ObservableMap<K, V>;
+class TerminalKeybindings extends React.Component<{ termWrap: any; lineid: string }, {}> {
+    componentDidMount(): void {
+        this.registerKeybindings();
+    }
+
+    registerKeybindings() {
+        const keybindManager = GlobalModel.keybindManager;
+        const domain = "line-" + this.props.lineid;
+        const termWrap = this.props.termWrap;
+        keybindManager.registerKeybinding("plugin", domain, "terminal:copy", (waveEvent) => {
+            const termWrap = this.props.termWrap;
+            const sel = termWrap.terminal.getSelection();
+            navigator.clipboard.writeText(sel);
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "terminal:paste", (waveEvent) => {
+            const p = navigator.clipboard.readText();
+            p.then((text) => {
+                termWrap.dataHandler?.(text, termWrap);
+            });
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "generic:selectAbove", (waveEvent) => {
+            termWrap.terminal.scrollLines(-1);
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "generic:selectBelow", (waveEvent) => {
+            termWrap.terminal.scrollLines(1);
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "generic:selectPageAbove", (waveEvent) => {
+            termWrap.terminal.scrollLines(-10);
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "generic:selectPageBelow", (waveEvent) => {
+            termWrap.terminal.scrollLines(10);
+            return true;
+        });
+    }
+
+    unregisterKeybindings() {
+        let domain = "line-" + this.props.lineid;
+        GlobalModel.keybindManager.unregisterDomain(domain);
+    }
+
+    componentWillUnmount(): void {
+        this.unregisterKeybindings();
+    }
+
+    render(): React.ReactNode {
+        return null;
+    }
+}
 
 @mobxReact.observer
-class TerminalRenderer extends React.Component<
-    {
-        screen: LineContainerModel;
-        line: LineType;
-        width: number;
-        staticRender: boolean;
-        visible: OV<boolean>;
-        onHeightChange: () => void;
-        collapsed: boolean;
-    },
-    {}
-> {
+class TerminalRenderer extends React.Component<{
+    screen: LineContainerType;
+    line: LineType;
+    width: number;
+    staticRender: boolean;
+    visible: OV<boolean>;
+    onHeightChange: () => void;
+    collapsed: boolean;
+}> {
     termLoaded: mobx.IObservableValue<boolean> = mobx.observable.box(false, {
         name: "linecmd-term-loaded",
     });
@@ -56,7 +102,7 @@ class TerminalRenderer extends React.Component<
     }
 
     getSnapshotBeforeUpdate(prevProps, prevState): { height: number } {
-        let elem = this.elemRef.current;
+        const elem = this.elemRef.current;
         if (elem == null) {
             return { height: 0 };
         }
@@ -67,9 +113,8 @@ class TerminalRenderer extends React.Component<
         if (this.props.onHeightChange == null) {
             return;
         }
-        let { line } = this.props;
         let curHeight = 0;
-        let elem = this.elemRef.current;
+        const elem = this.elemRef.current;
         if (elem != null) {
             curHeight = elem.offsetHeight;
         }
@@ -84,12 +129,12 @@ class TerminalRenderer extends React.Component<
     }
 
     checkLoad(): void {
-        let { line, staticRender, visible, collapsed } = this.props;
+        let { staticRender, visible, collapsed } = this.props;
         if (staticRender) {
             return;
         }
-        let vis = visible && visible.get() && !collapsed;
-        let curVis = this.termLoaded.get();
+        const vis = visible?.get() && !collapsed;
+        const curVis = this.termLoaded.get();
         if (vis && !curVis) {
             this.loadTerminal();
         } else if (!vis && curVis) {
@@ -98,13 +143,12 @@ class TerminalRenderer extends React.Component<
     }
 
     loadTerminal(): void {
-        let { screen, line } = this.props;
-        let model = GlobalModel;
-        let cmd = screen.getCmd(line);
+        const { screen, line } = this.props;
+        const cmd = screen.getCmd(line);
         if (cmd == null) {
             return;
         }
-        let termElem = this.termRef.current;
+        const termElem = this.termRef.current;
         if (termElem == null) {
             console.log("cannot load terminal, no term elem found", line);
             return;
@@ -114,11 +158,11 @@ class TerminalRenderer extends React.Component<
     }
 
     unloadTerminal(unmount: boolean): void {
-        let { screen, line } = this.props;
+        const { screen, line } = this.props;
         screen.unloadRenderer(line.lineid);
         if (!unmount) {
             mobx.action(() => this.termLoaded.set(false))();
-            let termElem = this.termRef.current;
+            const termElem = this.termRef.current;
             if (termElem != null) {
                 termElem.replaceChildren();
             }
@@ -127,22 +171,21 @@ class TerminalRenderer extends React.Component<
 
     @boundMethod
     clickTermBlock(e: any) {
-        let { screen, line } = this.props;
-        let model = GlobalModel;
-        let termWrap = screen.getTermWrap(line.lineid);
+        const { screen, line } = this.props;
+        const termWrap = screen.getTermWrap(line.lineid);
         if (termWrap != null) {
             termWrap.giveFocus();
         }
     }
 
     render() {
-        let { screen, line, width, staticRender, visible, collapsed } = this.props;
-        let isPhysicalFocused = mobx
+        const { screen, line, width, collapsed } = this.props;
+        const isPhysicalFocused = mobx
             .computed(() => screen.getIsFocused(line.linenum), {
                 name: "computed-getIsFocused",
             })
             .get();
-        let isFocused = mobx
+        const isFocused = mobx
             .computed(
                 () => {
                     let screenFocusType = screen.getFocusType();
@@ -151,27 +194,33 @@ class TerminalRenderer extends React.Component<
                 { name: "computed-isFocused" }
             )
             .get();
-        let cmd = screen.getCmd(line); // will not be null
-        let usedRows = screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, width);
-        let termHeight = termHeightFromRows(usedRows, GlobalModel.termFontSize.get());
+        const cmd = screen.getCmd(line); // will not be null
+        const usedRows = screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, width);
+        let termHeight = termHeightFromRows(usedRows, GlobalModel.getTermFontSize(), cmd.getTermMaxRows());
         if (usedRows === 0) {
             termHeight = 0;
         }
-        let termLoaded = this.termLoaded.get();
+        const termLoaded = this.termLoaded.get();
+        const lineid = line.lineid;
+        const termWrap = screen.getTermWrap(lineid);
         return (
             <div
                 ref={this.elemRef}
                 key="term-wrap"
-                className={cn(
+                className={clsx(
                     "terminal-wrapper",
                     { focus: isFocused },
                     { "cmd-done": !cmd.isRunning() },
                     { "zero-height": termHeight == 0 },
                     { collapsed: collapsed }
                 )}
+                data-usedrows={usedRows}
             >
                 <If condition={!isFocused}>
                     <div key="term-block" className="term-block" onClick={this.clickTermBlock}></div>
+                </If>
+                <If condition={isFocused}>
+                    <TerminalKeybindings termWrap={termWrap} lineid={lineid}></TerminalKeybindings>
                 </If>
                 <div
                     key="term-connectelem"

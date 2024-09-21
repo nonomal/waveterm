@@ -1,0 +1,82 @@
+.cmdstr-code {
+    position: relative;
+    display: flex;
+    flex-direction: row;
+    padding: 0px 10px 0px 0;
+
+    &.is-large {
+        .use-button {
+            height: 28px;
+            width: 28px;
+        }
+
+        .code-div code {
+        }
+    }
+
+    &.limit-height .code-div {
+        max-height: 58px;
+    }
+
+    &.limit-height.is-large .code-div {
+        max-height: 68px;
+    }
+
+    .use-button {
+        flex-grow: 0;
+        padding: 3px;
+        border-radius: 3px 0 0 3px;
+        height: 22px;
+        width: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        align-self: flex-start;
+        cursor: pointer;
+    }
+
+    .code-div {
+        display: flex;
+        flex-direction: row;
+        min-width: 100px;
+        overflow: auto;
+        border-left: 1px solid #777;
+
+        code {
+            flex-shrink: 0;
+            min-width: 100px;
+            color: var(--cmdstrcode-text-color);
+            white-space: pre;
+            padding: 2px 8px 2px 8px;
+            font-size: var(--termfontsize);
+            font-family: var(--termfontfamily);
+            line-height: var(--termlineheight);
+        }
+    }
+
+    .copy-control {
+        width: 0;
+        position: relative;
+        display: block;
+        visibility: hidden;
+
+        .inner-copy {
+            position: absolute;
+            bottom: -1px;
+            right: -20px;
+
+            padding: 2px;
+            padding-left: 4px;
+            cursor: pointer;
+            width: 20px;
+
+            &:hover {
+                color: var(--cmdstrcode-text-color);
+            }
+        }
+    }
+
+    &:hover .copy-control {
+        visibility: visible !important;
+    }
+}

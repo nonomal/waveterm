@@ -11,10 +11,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/packet"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/remote"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/scpacket"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/sstore"
-	"github.com/google/uuid"
 )
 
 const (
@@ -22,6 +23,11 @@ const (
 	R_Screen          = 2
 	R_Remote          = 8
 	R_RemoteConnected = 16
+)
+
+const (
+	ConnectedRemote = "connected"
+	LocalRemote     = "local"
 )
 
 type resolvedIds struct {
@@ -33,10 +39,11 @@ type resolvedIds struct {
 type ResolvedRemote struct {
 	DisplayName string
 	RemotePtr   sstore.RemotePtrType
-	MShell      *remote.MShellProc
+	Waveshell   *remote.WaveshellProc
 	RState      remote.RemoteRuntimeState
 	RemoteCopy  *sstore.RemoteType
-	StatePtr    *sstore.ShellStatePtr
+	ShellType   string // default remote shell preference
+	StatePtr    *packet.ShellStatePtr
 	FeState     map[string]string
 }
 
@@ -194,11 +201,11 @@ func resolveRemoteArg(remoteArg string) (*sstore.RemotePtrType, error) {
 	if rrUser != "" {
 		return nil, fmt.Errorf("remoteusers not supported")
 	}
-	msh := remote.GetRemoteByArg(rrRemote)
-	if msh == nil {
+	wsh := remote.GetRemoteByArg(rrRemote)
+	if wsh == nil {
 		return nil, nil
 	}
-	rcopy := msh.GetRemoteCopy()
+	rcopy := wsh.GetRemoteCopy()
 	return &sstore.RemotePtrType{RemoteId: rcopy.RemoteId, Name: rrName}, nil
 }
 
@@ -262,7 +269,7 @@ func resolveUiIds(ctx context.Context, pk *scpacket.FeCommandPacketType, rtype i
 	}
 	if rtype&R_RemoteConnected > 0 {
 		if !rtn.Remote.RState.IsConnected() {
-			err = rtn.Remote.MShell.TryAutoConnect()
+			err = rtn.Remote.Waveshell.TryAutoConnect()
 			if err != nil {
 				return rtn, fmt.Errorf("error trying to auto-connect remote [%s]: %w", rtn.Remote.DisplayName, err)
 			}
@@ -437,7 +444,7 @@ func parseFullRemoteRef(fullRemoteRef string) (string, string, string, error) {
 	if strings.HasPrefix(fullRemoteRef, "[") && strings.HasSuffix(fullRemoteRef, "]") {
 		fullRemoteRef = fullRemoteRef[1 : len(fullRemoteRef)-1]
 	}
-	fields := strings.Split(fullRemoteRef, ":")
+	fields := strings.Split(fullRemoteRef, "#")
 	if len(fields) > 3 {
 		return "", "", "", fmt.Errorf("invalid remote format '%s'", fullRemoteRef)
 	}
@@ -457,21 +464,22 @@ func ResolveRemoteFromPtr(ctx context.Context, rptr *sstore.RemotePtrType, sessi
 	if rptr == nil || rptr.RemoteId == "" {
 		return nil, nil
 	}
-	msh := remote.GetRemoteById(rptr.RemoteId)
-	if msh == nil {
+	wsh := remote.GetRemoteById(rptr.RemoteId)
+	if wsh == nil {
 		return nil, fmt.Errorf("invalid remote '%s', not found", rptr.RemoteId)
 	}
-	rstate := msh.GetRemoteRuntimeState()
-	rcopy := msh.GetRemoteCopy()
+	rstate := wsh.GetRemoteRuntimeState()
+	rcopy := wsh.GetRemoteCopy()
 	displayName := rstate.GetDisplayName(rptr)
 	rtn := &ResolvedRemote{
 		DisplayName: displayName,
 		RemotePtr:   *rptr,
 		RState:      rstate,
-		MShell:      msh,
+		Waveshell:   wsh,
 		RemoteCopy:  &rcopy,
 		StatePtr:    nil,
 		FeState:     nil,
+		ShellType:   "",
 	}
 	if sessionId != "" && screenId != "" {
 		ri, err := sstore.GetRemoteInstance(ctx, sessionId, screenId, *rptr)
@@ -480,11 +488,13 @@ func ResolveRemoteFromPtr(ctx context.Context, rptr *sstore.RemotePtrType, sessi
 			// continue with state set to nil
 		} else {
 			if ri == nil {
-				rtn.StatePtr = msh.GetDefaultStatePtr()
-				rtn.FeState = msh.GetDefaultFeState()
+				rtn.ShellType = wsh.GetShellPref()
+				rtn.StatePtr = nil
+				rtn.FeState = nil
 			} else {
-				rtn.StatePtr = &sstore.ShellStatePtr{BaseHash: ri.StateBaseHash, DiffHashArr: ri.StateDiffHashArr}
+				rtn.StatePtr = &packet.ShellStatePtr{BaseHash: ri.StateBaseHash, DiffHashArr: ri.StateDiffHashArr}
 				rtn.FeState = ri.FeState
+				rtn.ShellType = ri.ShellType
 			}
 		}
 	}

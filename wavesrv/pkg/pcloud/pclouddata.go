@@ -11,6 +11,7 @@ import (
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/remote"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/rtnstate"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/sstore"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/telemetry"
 )
 
 type NoTelemetryInputType struct {
@@ -19,10 +20,12 @@ type NoTelemetryInputType struct {
 }
 
 type TelemetryInputType struct {
-	UserId   string                 `json:"userid"`
-	ClientId string                 `json:"clientid"`
-	CurDay   string                 `json:"curday"`
-	Activity []*sstore.ActivityType `json:"activity"`
+	UserId       string                    `json:"userid"`
+	ClientId     string                    `json:"clientid"`
+	AppType      string                    `json:"apptype"`
+	CurDay       string                    `json:"curday"`
+	DefaultShell string                    `json:"defaultshell"`
+	Activity     []*telemetry.ActivityType `json:"activity"`
 }
 
 type WebShareUpdateType struct {

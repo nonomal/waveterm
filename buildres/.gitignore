@@ -1,3 +1,4 @@
-temp/
+*builds/
+*-staged/
 *.zip
 *.dmg

@@ -4,16 +4,12 @@
 import * as React from "react";
 import * as mobx from "mobx";
 import * as mobxReact from "mobx-react";
-import * as T from "../../types/types";
 
 import "./image.less";
 
-type OV<V> = mobx.IObservableValue<V>;
-type CV<V> = mobx.IComputedValue<V>;
-
 @mobxReact.observer
 class SimpleImageRenderer extends React.Component<
-    { data: T.ExtBlob; context: T.RendererContext; opts: T.RendererOpts; savedHeight: number },
+    { data: ExtBlob; context: RendererContext; opts: RendererOpts; savedHeight: number },
     {}
 > {
     objUrl: string = null;
@@ -52,12 +48,15 @@ class SimpleImageRenderer extends React.Component<
             return (
                 <div className="image-renderer" style={{ fontSize: this.props.opts.termFontSize }}>
                     <div className="load-error-text">
-                        ERROR: file {dataBlob && dataBlob.name ? JSON.stringify(dataBlob.name) : ""} not found
+                        ERROR: file {dataBlob?.name ? JSON.stringify(dataBlob.name) : ""} not found
                     </div>
                 </div>
             );
         }
         if (this.objUrl == null) {
+            if (dataBlob.name?.endsWith(".svg")) {
+                dataBlob = new Blob([dataBlob], { type: "image/svg+xml" }) as ExtBlob;
+            }
             this.objUrl = URL.createObjectURL(dataBlob);
         }
         let opts = this.props.opts;

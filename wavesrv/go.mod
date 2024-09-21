@@ -1,30 +1,39 @@
 module github.com/wavetermdev/waveterm/wavesrv
 
-go 1.18
+go 1.22
+
+toolchain go1.22.0
 
 require (
 	github.com/alessio/shellescape v1.4.1
 	github.com/armon/circbuf v0.0.0-20190214190532-5111143e8da2
 	github.com/creack/pty v1.1.18
+	github.com/fsnotify/fsnotify v1.6.0
 	github.com/golang-migrate/migrate/v4 v4.16.2
+	github.com/google/go-github/v60 v60.0.0
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/mux v1.8.0
 	github.com/gorilla/websocket v1.5.0
 	github.com/jmoiron/sqlx v1.3.5
+	github.com/kevinburke/ssh_config v1.2.0
 	github.com/mattn/go-sqlite3 v1.14.16
-	github.com/sashabaranov/go-openai v1.9.0
+	github.com/sashabaranov/go-openai v1.30.0
 	github.com/sawka/txwrap v0.1.2
 	github.com/wavetermdev/waveterm/waveshell v0.0.0
-	golang.org/x/crypto v0.7.0
+	golang.org/x/crypto v0.24.0
 	golang.org/x/mod v0.10.0
-	golang.org/x/sys v0.10.0
+	golang.org/x/sys v0.21.0
 	mvdan.cc/sh/v3 v3.7.0
 )
 
 require (
+	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/skeema/knownhosts v1.3.0 // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 )
 
 replace github.com/wavetermdev/waveterm/waveshell => ../waveshell
+
+replace github.com/kevinburke/ssh_config => github.com/wavetermdev/ssh_config v0.0.0-20240306041034-17e2087ebde2

@@ -2,15 +2,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as React from "react";
-import * as T from "../../types/types";
-import Editor from "@monaco-editor/react";
-import { Markdown } from "../../app/common/common";
-import { GlobalModel, GlobalCommandRunner } from "../../model/model";
+import * as mobx from "mobx";
+import { boundMethod } from "autobind-decorator";
+import Editor, { Monaco } from "@monaco-editor/react";
+import type * as MonacoTypes from "monaco-editor/esm/vs/editor/editor.api";
+import { clsx } from "clsx";
+import { If } from "tsx-control-statements/components";
+import { Markdown, Button } from "@/elements";
+import { GlobalModel, GlobalCommandRunner } from "@/models";
 import Split from "react-split-it";
 import loader from "@monaco-editor/loader";
-loader.config({ paths: { vs: "./node_modules/monaco-editor/min/vs" } });
+import { adaptFromReactOrNativeKeyEvent } from "@/util/keyutil";
 
 import "./code.less";
+
+// TODO: need to update these on theme change (pull from CSS vars)
+document.addEventListener("DOMContentLoaded", () => {
+    loader.config({ paths: { vs: "./node_modules/monaco-editor/min/vs" } });
+    loader.init().then(() => {
+        monaco.editor.defineTheme("wave-theme-dark", {
+            base: "hc-black",
+            inherit: true,
+            rules: [],
+            colors: {
+                "editor.background": "#000000",
+            },
+        });
+
+        monaco.editor.defineTheme("wave-theme-light", {
+            base: "hc-light",
+            inherit: true,
+            rules: [],
+            colors: {
+                "editor.background": "#fefefe",
+            },
+        });
+    });
+});
 
 function renderCmdText(text: string): any {
     return <span>&#x2318;{text}</span>;
@@ -19,22 +47,34 @@ function renderCmdText(text: string): any {
 // there is a global monaco variable (TODO get the correct TS type)
 declare var monaco: any;
 
+class CodeKeybindings extends React.Component<{ codeObject: SourceCodeRenderer }, {}> {
+    componentDidMount(): void {
+        this.props.codeObject.registerKeybindings();
+    }
+    componentWillUnmount(): void {
+        this.props.codeObject.unregisterKeybindings();
+    }
+    render() {
+        return null;
+    }
+}
+
 class SourceCodeRenderer extends React.Component<
     {
-        data: T.ExtBlob;
+        data: ExtBlob;
         cmdstr: string;
         cwd: string;
         readOnly: boolean;
         notFound: boolean;
         exitcode: number;
-        context: T.RendererContext;
-        opts: T.RendererOpts;
+        context: RendererContext;
+        opts: RendererOpts;
         savedHeight: number;
         scrollToBringIntoViewport: () => void;
-        lineState: T.LineStateType;
+        lineState: LineStateType;
         isSelected: boolean;
         shouldFocus: boolean;
-        rendererApi: T.RendererModelContainerApi;
+        rendererApi: RendererModelContainerApi;
     },
     {
         code: string;
@@ -43,7 +83,7 @@ class SourceCodeRenderer extends React.Component<
         isSave: boolean;
         isClosed: boolean;
         editorHeight: number;
-        message: { status: string; text: string };
+        message: { status: "success" | "error"; text: string };
         isPreviewerAvailable: boolean;
         showPreview: boolean;
         editorFraction: number;
@@ -54,24 +94,24 @@ class SourceCodeRenderer extends React.Component<
      * codeCache is a Hashmap with key=screenId:lineId:filepath and value=code
      * Editor should never read the code directly from the filesystem. it should read from the cache.
      */
-    static codeCache = new Map();
+    static readonly codeCache = new Map();
 
     // which languages have preview options
-    languagesWithPreviewer = ["markdown"];
-    filePath;
-    cacheKey;
-    originalCode;
-    monacoEditor: any; // reference to mounted monaco editor.  TODO need the correct type
-    markdownRef;
-    syncing;
+    languagesWithPreviewer: string[] = ["markdown", "mdx"];
+    filePath: string;
+    cacheKey: string;
+    originalCode: string;
+    monacoEditor: MonacoTypes.editor.IStandaloneCodeEditor; // reference to mounted monaco editor.  TODO need the correct type
+    markdownRef: React.RefObject<HTMLDivElement>;
+    syncing: boolean;
 
     constructor(props) {
         super(props);
         this.monacoEditor = null;
-        const editorHeight = Math.max(props.savedHeight - 25, 0); // must subtract the padding/margin to get the real editorHeight
+        const editorHeight = Math.max(props.savedHeight - this.getEditorHeightBuffer(), 0); // must subtract the padding/margin to get the real editorHeight
         this.markdownRef = React.createRef();
         this.syncing = false;
-        let isClosed = props.lineState["prompt:closed"];
+        const isClosed = props.lineState["prompt:closed"];
         this.state = {
             code: null,
             languages: [],
@@ -103,6 +143,10 @@ class SourceCodeRenderer extends React.Component<
         }
     }
 
+    componentWillUnmount() {
+        this.unregisterKeybindings();
+    }
+
     componentDidUpdate(prevProps: any): void {
         if (!prevProps.shouldFocus && this.props.shouldFocus) {
             if (this.monacoEditor) {
@@ -111,12 +155,14 @@ class SourceCodeRenderer extends React.Component<
         }
     }
 
-    saveLineState = (kvp) => {
+    @boundMethod
+    saveLineState(kvp) {
         const { screenId, lineId } = this.props.context;
         GlobalCommandRunner.setLineState(screenId, lineId, { ...this.props.lineState, ...kvp }, false);
-    };
+    }
 
-    setInitialLanguage = (editor) => {
+    @boundMethod
+    setInitialLanguage(editor) {
         // set all languages
         const languages = monaco.languages.getLanguages().map((lang) => lang.id);
         this.setState({ languages });
@@ -125,7 +171,7 @@ class SourceCodeRenderer extends React.Component<
         // if not found, we try to grab the filename from with filePath (coming from lineState["prompt:file"]) or cmdstr
         if (!detectedLanguage) {
             const strForFilePath = this.filePath || this.props.cmdstr;
-            const extension = strForFilePath.match(/(?:[^\\\/:*?"<>|\r\n]+\.)([a-zA-Z0-9]+)\b/)?.[1] || "";
+            const extension = RegExp(/(?:[^\\/:*?"<>|\r\n]+\.)([a-zA-Z0-9]+)\b/).exec(strForFilePath)?.[1] || "";
             const detectedLanguageObj = monaco.languages
                 .getLanguages()
                 .find((lang) => lang.extensions?.includes("." + extension));
@@ -144,24 +190,53 @@ class SourceCodeRenderer extends React.Component<
                 });
             }
         }
-    };
+    }
 
-    handleEditorDidMount = (editor, monaco) => {
+    @boundMethod
+    registerKeybindings() {
+        const { lineId } = this.props.context;
+        const domain = "code-" + lineId;
+        const keybindManager = GlobalModel.keybindManager;
+        keybindManager.registerKeybinding("plugin", domain, "codeedit:save", (waveEvent) => {
+            this.doSave();
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "codeedit:close", (waveEvent) => {
+            this.doClose();
+            return true;
+        });
+        keybindManager.registerKeybinding("plugin", domain, "codeedit:togglePreview", (waveEvent) => {
+            this.togglePreview();
+            return true;
+        });
+    }
+
+    @boundMethod
+    unregisterKeybindings() {
+        const { lineId } = this.props.context;
+        const domain = "code-" + lineId;
+        GlobalModel.keybindManager.unregisterDomain(domain);
+    }
+
+    @boundMethod
+    handleEditorDidMount(editor: MonacoTypes.editor.IStandaloneCodeEditor, monaco: Monaco) {
         this.monacoEditor = editor;
         this.setInitialLanguage(editor);
         this.setEditorHeight();
-        editor.onKeyDown((e) => {
-            if (e.code === "KeyS" && (e.ctrlKey || e.metaKey) && this.state.isSave) {
-                e.preventDefault();
-                this.doSave();
-            }
-            if (e.code === "KeyD" && (e.ctrlKey || e.metaKey)) {
-                e.preventDefault();
-                this.doClose();
-            }
-            if (e.code === "KeyP" && (e.ctrlKey || e.metaKey)) {
-                e.preventDefault();
-                this.togglePreview();
+        setTimeout(() => {
+            const opts = this.getEditorOptions();
+            editor.updateOptions(opts);
+        }, 2000);
+        editor.onKeyDown((e: MonacoTypes.IKeyboardEvent) => {
+            const waveEvent = adaptFromReactOrNativeKeyEvent(e.browserEvent);
+            if (
+                GlobalModel.keybindManager.checkKeysPressed(waveEvent, [
+                    "codeedit:save",
+                    "codeedit:close",
+                    "codeedit:togglePreview",
+                ])
+            ) {
+                GlobalModel.keybindManager.processKeyEvent(e.browserEvent, waveEvent);
             }
         });
         editor.onDidScrollChange((e) => {
@@ -184,8 +259,9 @@ class SourceCodeRenderer extends React.Component<
             });
         }
         if (!this.getAllowEditing()) this.setState({ showReadonly: true });
-    };
+    }
 
+    @boundMethod
     handleEditorScrollChange(e) {
         if (!this.state.showPreview) return;
         const scrollableHeightEditor = this.monacoEditor.getScrollHeight() - this.monacoEditor.getLayoutInfo().height;
@@ -197,6 +273,7 @@ class SourceCodeRenderer extends React.Component<
         }
     }
 
+    @boundMethod
     handleDivScroll() {
         if (!this.syncing) {
             this.syncing = true;
@@ -214,8 +291,9 @@ class SourceCodeRenderer extends React.Component<
         }
     }
 
-    handleLanguageChange = (event) => {
-        const selectedLanguage = event.target.value;
+    @boundMethod
+    handleLanguageChange(e: any) {
+        const selectedLanguage = e.target.value;
         this.setState({
             selectedLanguage,
             isPreviewerAvailable: this.languagesWithPreviewer.includes(selectedLanguage),
@@ -227,9 +305,10 @@ class SourceCodeRenderer extends React.Component<
                 this.saveLineState({ lang: selectedLanguage });
             }
         }
-    };
+    }
 
-    doSave = (onSave = () => {}) => {
+    @boundMethod
+    doSave(onSave = () => {}) {
         if (!this.state.isSave) return;
         const { screenId, lineId } = this.props.context;
         const encodedCode = new TextEncoder().encode(this.state.code);
@@ -249,9 +328,10 @@ class SourceCodeRenderer extends React.Component<
                 this.setState({ message: { status: "error", text: e.message } });
                 setTimeout(() => this.setState({ message: null }), 3000);
             });
-    };
+    }
 
-    doClose = () => {
+    @boundMethod
+    doClose() {
         // if there is unsaved data
         if (this.state.isSave)
             return GlobalModel.showAlert({
@@ -286,93 +366,131 @@ class SourceCodeRenderer extends React.Component<
         if (this.props.shouldFocus) {
             GlobalCommandRunner.screenSetFocus("input");
         }
-    };
+    }
 
-    handleEditorChange = (code) => {
+    @boundMethod
+    handleEditorChange(code) {
         SourceCodeRenderer.codeCache.set(this.cacheKey, code);
         this.setState({ code }, () => {
             this.setEditorHeight();
             this.setState({ isSave: code !== this.originalCode });
         });
-    };
+    }
 
-    setEditorHeight = () => {
-        const fullWindowHeight = this.props.opts.maxSize.height;
-        let _editorHeight = fullWindowHeight;
-        let allowEditing = this.getAllowEditing();
+    @boundMethod
+    getEditorHeightBuffer(): number {
+        const heightBuffer = GlobalModel.lineHeightEnv.lineHeight + 11;
+        return heightBuffer;
+    }
+
+    @boundMethod
+    setEditorHeight() {
+        const maxEditorHeight = this.props.opts.maxSize.height - this.getEditorHeightBuffer();
+        let _editorHeight = maxEditorHeight;
+        const allowEditing = this.getAllowEditing();
         if (!allowEditing) {
             const noOfLines = Math.max(this.state.code.split("\n").length, 5);
-            const lineHeight = Math.ceil(GlobalModel.termFontSize.get() * 1.5);
-            _editorHeight = Math.min(noOfLines * lineHeight + 10, fullWindowHeight);
+            const lineHeight = Math.ceil(GlobalModel.lineHeightEnv.lineHeight);
+            _editorHeight = Math.min(noOfLines * lineHeight + 10, maxEditorHeight);
         }
         this.setState({ editorHeight: _editorHeight }, () => {
             if (this.props.isSelected) {
                 this.props.scrollToBringIntoViewport();
             }
         });
-    };
+    }
 
+    @boundMethod
     getAllowEditing(): boolean {
-        let lineState = this.props.lineState;
-        let mode = lineState["mode"] || "view";
+        const lineState = this.props.lineState;
+        const mode = lineState["mode"] || "view";
         if (mode == "view") {
             return false;
         }
         return !(this.props.readOnly || this.state.isClosed);
     }
 
-    getCodeEditor = () => (
-        <div style={{ maxHeight: this.props.opts.maxSize.height }}>
-            {this.state.showReadonly && <div className="readonly">{"read-only"}</div>}
-            <Editor
-                theme="hc-black"
-                height={this.state.editorHeight}
-                defaultLanguage={this.state.selectedLanguage}
-                value={this.state.code}
-                onMount={this.handleEditorDidMount}
-                options={{
-                    scrollBeyondLastLine: false,
-                    fontSize: GlobalModel.termFontSize.get() * 0.9,
-                    /* fontFamily: "Martian Mono", */
-                    readOnly: !this.getAllowEditing(),
-                }}
-                onChange={this.handleEditorChange}
-            />
-        </div>
-    );
+    @boundMethod
+    updateEditorOpts(): void {
+        if (!this.monacoEditor) {
+            return;
+        }
+        const opts = this.getEditorOptions();
+        this.monacoEditor.updateOptions(opts);
+    }
 
-    getPreviewer = () => {
+    @boundMethod
+    getEditorOptions(): MonacoTypes.editor.IEditorOptions {
+        const opts: MonacoTypes.editor.IEditorOptions = {
+            scrollBeyondLastLine: false,
+            fontSize: GlobalModel.getTermFontSize(),
+            fontFamily: GlobalModel.getTermFontFamily(),
+            readOnly: !this.getAllowEditing(),
+        };
+        const lineState = this.props.lineState;
+        if (this.state.showPreview || ("minimap" in lineState && !lineState["minimap"])) {
+            opts.minimap = { enabled: false };
+        }
+        return opts;
+    }
+
+    @boundMethod
+    getCodeEditor(theme: string) {
+        return (
+            <div className="editor-wrap" style={{ maxHeight: this.state.editorHeight }}>
+                {this.state.showReadonly && <div className="readonly">{"read-only"}</div>}
+                <Editor
+                    theme={theme}
+                    height={this.state.editorHeight}
+                    defaultLanguage={this.state.selectedLanguage}
+                    value={this.state.code}
+                    onMount={this.handleEditorDidMount}
+                    options={this.getEditorOptions()}
+                    onChange={this.handleEditorChange}
+                />
+            </div>
+        );
+    }
+
+    @boundMethod
+    getPreviewer() {
         return (
             <div
                 className="scroller"
-                style={{ maxHeight: this.props.opts.maxSize.height }}
+                style={{ maxHeight: this.state.editorHeight }}
                 ref={this.markdownRef}
                 onScroll={() => this.handleDivScroll()}
             >
                 <Markdown text={this.state.code} style={{ width: "100%", padding: "1rem" }} />
             </div>
         );
-    };
+    }
 
-    togglePreview = () => {
-        this.saveLineState({ showPreview: !this.state.showPreview });
-        this.setState({ showPreview: !this.state.showPreview });
-    };
+    @boundMethod
+    togglePreview() {
+        this.setState((prevState) => {
+            const newPreviewState = { showPreview: !prevState.showPreview };
+            this.saveLineState(newPreviewState);
+            return newPreviewState;
+        });
+        setTimeout(() => this.updateEditorOpts(), 0);
+    }
 
-    getEditorControls = () => {
-        const { selectedLanguage, isSave, languages, isPreviewerAvailable, showPreview } = this.state;
-        let allowEditing = this.getAllowEditing();
+    @boundMethod
+    getEditorControls() {
+        const { selectedLanguage, languages, isPreviewerAvailable, showPreview } = this.state;
+        const allowEditing = this.getAllowEditing();
         return (
-            <div className="buttonContainer">
-                {isPreviewerAvailable && (
-                    <div className="button">
+            <>
+                <If condition={isPreviewerAvailable}>
+                    <Button className="primary" termInline={true}>
                         <div onClick={this.togglePreview} className={`preview`}>
                             {`${showPreview ? "hide" : "show"} preview (`}
                             {renderCmdText("P")}
                             {`)`}
                         </div>
-                    </div>
-                )}
+                    </Button>
+                </If>
                 <select className="dropdown" value={selectedLanguage} onChange={this.handleLanguageChange}>
                     {languages.map((lang, index) => (
                         <option key={index} value={lang}>
@@ -380,40 +498,42 @@ class SourceCodeRenderer extends React.Component<
                         </option>
                     ))}
                 </select>
-                {allowEditing && (
-                    <div className={`button ${isSave ? "" : "disabled"}`}>
+                <If condition={allowEditing}>
+                    <Button className="primary" termInline={true}>
                         <div onClick={() => this.doSave()}>
                             {`save (`}
                             {renderCmdText("S")}
                             {`)`}
                         </div>
-                    </div>
-                )}
-                {allowEditing && (
-                    <div className="button">
+                    </Button>
+                    <Button className="primary" termInline={true}>
                         <div onClick={this.doClose} className={`close`}>
                             {`close (`}
                             {renderCmdText("D")}
                             {`)`}
                         </div>
-                    </div>
-                )}
+                    </Button>
+                </If>
+            </>
+        );
+    }
+
+    @boundMethod
+    getMessage() {
+        return (
+            <div className="messageContainer">
+                <div className={`message ${this.state.message.status === "error" ? "error" : ""}`}>
+                    {this.state.message.text}
+                </div>
             </div>
         );
-    };
+    }
 
-    getMessage = () => (
-        <div className="messageContainer">
-            <div className={`message ${this.state.message.status === "error" ? "error" : ""}`}>
-                {this.state.message.text}
-            </div>
-        </div>
-    );
-
-    setSizes = (sizes) => {
+    @boundMethod
+    setSizes(sizes: number[]) {
         this.setState({ editorFraction: sizes[0] });
         this.saveLineState({ editorFraction: sizes[0] });
-    };
+    }
 
     render() {
         const { exitcode } = this.props;
@@ -429,7 +549,7 @@ class SourceCodeRenderer extends React.Component<
                 <div
                     className="code-renderer"
                     style={{
-                        fontSize: GlobalModel.termFontSize.get(),
+                        fontSize: GlobalModel.getTermFontSize(),
                         color: "white",
                     }}
                 >
@@ -437,14 +557,35 @@ class SourceCodeRenderer extends React.Component<
                 </div>
             );
         }
+        const { lineNum } = this.props.context;
+        const screen = GlobalModel.getActiveScreen();
+        const lineIsSelected = mobx.computed(
+            () => screen.getSelectedLine() == lineNum && screen.getFocusType() == "cmd",
+            {
+                name: "code-lineisselected",
+            }
+        );
+
+        const theme = `wave-theme-${GlobalModel.isDarkTheme.get() ? "dark" : "light"}`;
         return (
             <div className="code-renderer">
+                <If condition={lineIsSelected.get()}>
+                    <CodeKeybindings codeObject={this}></CodeKeybindings>
+                </If>
                 <Split sizes={[editorFraction, 1 - editorFraction]} onSetSizes={this.setSizes}>
-                    {this.getCodeEditor()}
+                    {this.getCodeEditor(theme)}
                     {isPreviewerAvailable && showPreview && this.getPreviewer()}
                 </Split>
-                {this.getEditorControls()}
-                {message && this.getMessage()}
+                <div className="flex-spacer" />
+                <div className="code-statusbar">
+                    <If condition={message != null}>
+                        <div className={clsx("code-message", { error: message.status == "error" })}>
+                            {this.state.message.text}
+                        </div>
+                    </If>
+                    <div className="flex-spacer" />
+                    {this.getEditorControls()}
+                </div>
             </div>
         );
     }

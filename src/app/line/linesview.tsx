@@ -7,20 +7,17 @@ import * as mobx from "mobx";
 import { sprintf } from "sprintf-js";
 import { boundMethod } from "autobind-decorator";
 import { If, For, When, Otherwise, Choose } from "tsx-control-statements/components";
-import cn from "classnames";
+import { clsx } from "clsx";
 import dayjs from "dayjs";
 import localizedFormat from "dayjs/plugin/localizedFormat";
 import { debounce, throttle } from "throttle-debounce";
-import * as T from "../../types/types";
-import * as util from "../../util/util";
+import * as util from "@/util/util";
 import * as lineutil from "./lineutil";
 
 import "./lines.less";
+import { GlobalModel } from "@/models";
 
 dayjs.extend(localizedFormat);
-type OV<V> = mobx.IObservableValue<V>;
-type OArr<V> = mobx.IObservableArray<V>;
-type OMap<K, V> = mobx.ObservableMap<K, V>;
 
 const LinesVisiblePadding = 500;
 
@@ -28,19 +25,21 @@ type ScreenInterface = {
     setAnchorFields(anchorLine: number, anchorOffset: number, reason: string): void;
     getSelectedLine(): number;
     getAnchor(): { anchorLine: number; anchorOffset: number };
+    isLineIdInSidebar(lineId: string): boolean;
+    getLineByNum(lineNum: number): LineType;
 };
 
 // <Line key={line.lineid} line={line} screen={screen} width={width} visible={this.visibleMap.get(lineNumStr)} staticRender={this.staticRender.get()} onHeightChange={this.onHeightChange} overrideCollapsed={this.collapsedMap.get(lineNumStr)} topBorder={topBorder} renderMode={renderMode}/>;
 
-type LineCompFactory = (props: T.LineFactoryProps) => JSX.Element;
+type LineCompFactory = (props: LineFactoryProps) => JSX.Element;
 
 @mobxReact.observer
 class LinesView extends React.Component<
     {
         screen: ScreenInterface;
         width: number;
-        lines: T.LineInterface[];
-        renderMode: T.RenderModeType;
+        lines: LineInterface[];
+        renderMode: RenderModeType;
         lineFactory: LineCompFactory;
     },
     {}
@@ -298,6 +297,10 @@ class LinesView extends React.Component<
         if (newLine == 0) {
             return;
         }
+        let line = screen.getLineByNum(newLine);
+        if (line == null || screen.isLineIdInSidebar(line.lineid)) {
+            return;
+        }
         let lidx = this.findClosestLineIndex(newLine);
         this.setLineVisible(newLine, true);
         // console.log("update selected line", this.lastSelectedLine, "=>", newLine, sprintf("anchor=%d:%d", screen.anchorLine, screen.anchorOffset));
@@ -351,7 +354,7 @@ class LinesView extends React.Component<
         }
     }
 
-    handleResize(entries: any) {
+    handleResize(entries: ResizeObserverEntry[]) {
         let linesElem = this.linesRef.current;
         if (linesElem == null) {
             return;
@@ -378,7 +381,7 @@ class LinesView extends React.Component<
         this.computeVisibleMap_debounced();
     }
 
-    hasTopBorder(lines: T.LineInterface[], idx: number): boolean {
+    hasTopBorder(lines: LineInterface[], idx: number): boolean {
         if (idx == 0) {
             return false;
         }
@@ -388,7 +391,7 @@ class LinesView extends React.Component<
     }
 
     getDateSepStr(
-        lines: T.LineInterface[],
+        lines: LineInterface[],
         idx: number,
         prevStr: string,
         todayStr: string,
@@ -404,7 +407,7 @@ class LinesView extends React.Component<
         return null;
     }
 
-    findClosestLineIndex(lineNum: number): { line: T.LineInterface; index: number } {
+    findClosestLineIndex(lineNum: number): { line: LineInterface; index: number } {
         let { lines } = this.props;
         if (lines.length == 0) {
             throw new Error("invalid lines, cannot have 0 length in LinesView");
@@ -438,7 +441,7 @@ class LinesView extends React.Component<
     render() {
         let { screen, width, lines, renderMode } = this.props;
         let selectedLine = screen.getSelectedLine(); // for re-rendering
-        let line: T.LineInterface = null;
+        let line: LineInterface = null;
         for (let i = 0; i < lines.length; i++) {
             let key = String(lines[i].linenum);
             let visObs = this.visibleMap.get(key);
@@ -469,11 +472,13 @@ class LinesView extends React.Component<
             prevDateStr = curDateStr;
             if (dateSepStr != null) {
                 let sepElem = (
-                    <div key={"sep-" + line.lineid} className="line-sep">
+                    <div key={"sep-" + line.lineid} className="line-sep-labeled">
                         {dateSepStr}
                     </div>
                 );
                 lineElements.push(sepElem);
+            } else if (idx > 0) {
+                lineElements.push(<div key={"sep-" + line.lineid} className="line-sep"></div>);
             }
             let topBorder = dateSepStr == null && this.hasTopBorder(lines, idx);
             let lineProps = {
@@ -491,7 +496,7 @@ class LinesView extends React.Component<
             // let lineElem = <Line key={line.lineid} line={line} screen={screen} width={width} visible={this.visibleMap.get(lineNumStr)} staticRender={this.staticRender.get()} onHeightChange={this.onHeightChange} overrideCollapsed={this.collapsedMap.get(lineNumStr)} topBorder={topBorder} renderMode={renderMode}/>;
             lineElements.push(lineElem);
         }
-        let linesClass = cn("lines", renderMode == "normal" ? "lines-expanded" : "lines-collapsed");
+        let linesClass = clsx("lines", renderMode == "normal" ? "lines-expanded" : "lines-collapsed", "wide-scrollbar");
         return (
             <div key="lines" className={linesClass} onScroll={this.scrollHandler} ref={this.linesRef}>
                 <div className="lines-spacer"></div>

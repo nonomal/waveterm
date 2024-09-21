@@ -13,18 +13,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/sawka/txwrap"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/base"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/packet"
-	"github.com/wavetermdev/waveterm/waveshell/pkg/shexec"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/shellapi"
+	"github.com/wavetermdev/waveterm/waveshell/pkg/utilfn"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/dbutil"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbase"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbus"
 )
-
-const HistoryCols = "h.historyid, h.ts, h.userid, h.sessionid, h.screenid, h.lineid, h.haderror, h.cmdstr, h.remoteownerid, h.remoteid, h.remotename, h.ismetacmd, h.incognito, h.linenum"
-const DefaultMaxHistoryItems = 1000
 
 var updateWriterCVar = sync.NewCond(&sync.Mutex{})
 var WebScreenPtyPosLock = &sync.Mutex{}
@@ -97,6 +95,17 @@ func NumSessions(ctx context.Context) (int, error) {
 	return numSessions, txErr
 }
 
+func NumScreens(ctx context.Context) (int, error) {
+	var numScreens int
+	txErr := WithTx(ctx, func(tx *TxWrap) error {
+		query := "SELECT count(*) FROM screen"
+		numScreens = tx.GetInt(query)
+		return nil
+	})
+	return numScreens, txErr
+
+}
+
 func GetAllRemotes(ctx context.Context) ([]*RemoteType, error) {
 	var rtn []*RemoteType
 	err := WithTx(ctx, func(tx *TxWrap) error {
@@ -104,6 +113,25 @@ func GetAllRemotes(ctx context.Context) ([]*RemoteType, error) {
 		marr := tx.SelectMaps(query)
 		for _, m := range marr {
 			rtn = append(rtn, dbutil.FromMap[*RemoteType](m))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rtn, nil
+}
+
+func GetAllImportedRemotes(ctx context.Context) (map[string]*RemoteType, error) {
+	rtn := make(map[string]*RemoteType)
+	err := WithTx(ctx, func(tx *TxWrap) error {
+		query := `SELECT * FROM remote
+		          WHERE sshconfigsrc = "sshconfig-import"
+				  ORDER BY remoteidx`
+		marr := tx.SelectMaps(query)
+		for _, m := range marr {
+			remote := dbutil.FromMap[*RemoteType](m)
+			rtn[remote.RemoteCanonicalName] = remote
 		}
 		return nil
 	})
@@ -198,8 +226,8 @@ func UpsertRemote(ctx context.Context, r *RemoteType) error {
 		maxRemoteIdx := tx.GetInt(query)
 		r.RemoteIdx = int64(maxRemoteIdx + 1)
 		query = `INSERT INTO remote
-            ( remoteid, remotetype, remotealias, remotecanonicalname, remoteuser, remotehost, connectmode, autoinstall, sshopts, remoteopts, lastconnectts, archived, remoteidx, local, statevars, openaiopts) VALUES
-            (:remoteid,:remotetype,:remotealias,:remotecanonicalname,:remoteuser,:remotehost,:connectmode,:autoinstall,:sshopts,:remoteopts,:lastconnectts,:archived,:remoteidx,:local,:statevars,:openaiopts)`
+            ( remoteid, remotetype, remotealias, remotecanonicalname, remoteuser, remotehost, connectmode, autoinstall, sshopts, remoteopts, lastconnectts, archived, remoteidx, local, statevars, sshconfigsrc, openaiopts, shellpref) VALUES
+            (:remoteid,:remotetype,:remotealias,:remotecanonicalname,:remoteuser,:remotehost,:connectmode,:autoinstall,:sshopts,:remoteopts,:lastconnectts,:archived,:remoteidx,:local,:statevars,:sshconfigsrc,:openaiopts,:shellpref)`
 		tx.NamedExec(query, r.ToMap())
 		return nil
 	})
@@ -211,182 +239,6 @@ func UpdateRemoteStateVars(ctx context.Context, remoteId string, stateVars map[s
 		query := `UPDATE remote SET statevars = ? WHERE remoteid = ?`
 		tx.Exec(query, quickJson(stateVars), remoteId)
 		return nil
-	})
-}
-
-func InsertHistoryItem(ctx context.Context, hitem *HistoryItemType) error {
-	if hitem == nil {
-		return fmt.Errorf("cannot insert nil history item")
-	}
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `INSERT INTO history 
-                  ( historyid, ts, userid, sessionid, screenid, lineid, haderror, cmdstr, remoteownerid, remoteid, remotename, ismetacmd, incognito, linenum) VALUES
-                  (:historyid,:ts,:userid,:sessionid,:screenid,:lineid,:haderror,:cmdstr,:remoteownerid,:remoteid,:remotename,:ismetacmd,:incognito,:linenum)`
-		tx.NamedExec(query, hitem.ToMap())
-		return nil
-	})
-	return txErr
-}
-
-func IsIncognitoScreen(ctx context.Context, sessionId string, screenId string) (bool, error) {
-	return false, nil
-}
-
-const HistoryQueryChunkSize = 1000
-
-func _getNextHistoryItem(items []*HistoryItemType, index int, filterFn func(*HistoryItemType) bool) (*HistoryItemType, int) {
-	for ; index < len(items); index++ {
-		item := items[index]
-		if filterFn(item) {
-			return item, index
-		}
-	}
-	return nil, index
-}
-
-// returns true if done, false if we still need to process more items
-func (result *HistoryQueryResult) processItem(item *HistoryItemType, rawOffset int) bool {
-	if result.prevItems < result.Offset {
-		result.prevItems++
-		return false
-	}
-	if len(result.Items) == result.MaxItems {
-		result.HasMore = true
-		result.NextRawOffset = rawOffset
-		return true
-	}
-	if len(result.Items) == 0 {
-		result.RawOffset = rawOffset
-	}
-	result.Items = append(result.Items, item)
-	return false
-}
-
-func runHistoryQueryWithFilter(tx *TxWrap, opts HistoryQueryOpts) (*HistoryQueryResult, error) {
-	if opts.MaxItems == 0 {
-		return nil, fmt.Errorf("invalid query, maxitems is 0")
-	}
-	rtn := &HistoryQueryResult{Offset: opts.Offset, MaxItems: opts.MaxItems}
-	var rawOffset int
-	if opts.RawOffset >= opts.Offset {
-		rtn.prevItems = opts.Offset
-		rawOffset = opts.RawOffset
-	} else {
-		rawOffset = 0
-	}
-	for {
-		resultItems, err := runHistoryQuery(tx, opts, rawOffset, HistoryQueryChunkSize)
-		if err != nil {
-			return nil, err
-		}
-		isDone := false
-		for resultIdx := 0; resultIdx < len(resultItems); resultIdx++ {
-			if opts.FilterFn != nil && !opts.FilterFn(resultItems[resultIdx]) {
-				continue
-			}
-			isDone = rtn.processItem(resultItems[resultIdx], rawOffset+resultIdx)
-			if isDone {
-				break
-			}
-		}
-		if isDone {
-			break
-		}
-		if len(resultItems) < HistoryQueryChunkSize {
-			break
-		}
-		rawOffset += HistoryQueryChunkSize
-	}
-	return rtn, nil
-}
-
-func runHistoryQuery(tx *TxWrap, opts HistoryQueryOpts, realOffset int, itemLimit int) ([]*HistoryItemType, error) {
-	// check sessionid/screenid format because we are directly inserting them into the SQL
-	if opts.SessionId != "" {
-		_, err := uuid.Parse(opts.SessionId)
-		if err != nil {
-			return nil, fmt.Errorf("malformed sessionid")
-		}
-	}
-	if opts.ScreenId != "" {
-		_, err := uuid.Parse(opts.ScreenId)
-		if err != nil {
-			return nil, fmt.Errorf("malformed screenid")
-		}
-	}
-	if opts.RemoteId != "" {
-		_, err := uuid.Parse(opts.RemoteId)
-		if err != nil {
-			return nil, fmt.Errorf("malformed remoteid")
-		}
-	}
-	whereClause := "WHERE 1"
-	var queryArgs []interface{}
-	hNumStr := ""
-	if opts.SessionId != "" && opts.ScreenId != "" {
-		whereClause += fmt.Sprintf(" AND h.sessionid = '%s' AND h.screenid = '%s'", opts.SessionId, opts.ScreenId)
-		hNumStr = ""
-	} else if opts.SessionId != "" {
-		whereClause += fmt.Sprintf(" AND h.sessionid = '%s'", opts.SessionId)
-		hNumStr = "s"
-	} else {
-		hNumStr = "g"
-	}
-	if opts.SearchText != "" {
-		whereClause += " AND h.cmdstr LIKE ? ESCAPE '\\'"
-		likeArg := opts.SearchText
-		likeArg = strings.ReplaceAll(likeArg, "%", "\\%")
-		likeArg = strings.ReplaceAll(likeArg, "_", "\\_")
-		queryArgs = append(queryArgs, "%"+likeArg+"%")
-	}
-	if opts.FromTs > 0 {
-		whereClause += fmt.Sprintf(" AND h.ts <= %d", opts.FromTs)
-	}
-	if opts.RemoteId != "" {
-		whereClause += fmt.Sprintf(" AND h.remoteid = '%s'", opts.RemoteId)
-	}
-	if opts.NoMeta {
-		whereClause += " AND NOT h.ismetacmd"
-	}
-	query := fmt.Sprintf("SELECT %s, ('%s' || CAST((row_number() OVER win) as text)) historynum FROM history h %s WINDOW win AS (ORDER BY h.ts, h.historyid) ORDER BY h.ts DESC, h.historyid DESC LIMIT %d OFFSET %d", HistoryCols, hNumStr, whereClause, itemLimit, realOffset)
-	marr := tx.SelectMaps(query, queryArgs...)
-	rtn := make([]*HistoryItemType, len(marr))
-	for idx, m := range marr {
-		hitem := dbutil.FromMap[*HistoryItemType](m)
-		rtn[idx] = hitem
-	}
-	return rtn, nil
-}
-
-func GetHistoryItems(ctx context.Context, opts HistoryQueryOpts) (*HistoryQueryResult, error) {
-	var rtn *HistoryQueryResult
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		var err error
-		rtn, err = runHistoryQueryWithFilter(tx, opts)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-	if txErr != nil {
-		return nil, txErr
-	}
-	return rtn, nil
-}
-
-func GetHistoryItemByLineNum(ctx context.Context, screenId string, lineNum int) (*HistoryItemType, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) (*HistoryItemType, error) {
-		query := `SELECT * FROM history WHERE screenid = ? AND linenum = ?`
-		hitem := dbutil.GetMapGen[*HistoryItemType](tx, query, screenId, lineNum)
-		return hitem, nil
-	})
-}
-
-func GetLastHistoryLineNum(ctx context.Context, screenId string) (int, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) (int, error) {
-		query := `SELECT COALESCE(max(linenum), 0) FROM history WHERE screenid = ?`
-		maxLineNum := tx.GetInt(query, screenId)
-		return maxLineNum, nil
 	})
 }
 
@@ -437,20 +289,32 @@ func GetBareSessionById(ctx context.Context, sessionId string) (*SessionType, er
 	return &rtn, nil
 }
 
-func GetAllSessions(ctx context.Context) (*ModelUpdate, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) (*ModelUpdate, error) {
-		update := &ModelUpdate{}
-		query := `SELECT * FROM session ORDER BY archived, sessionidx, archivedts`
-		tx.Select(&update.Sessions, query)
+const getAllSessionsQuery = `SELECT * FROM session ORDER BY archived, sessionidx, archivedts`
+
+// Gets all sessions, including archived
+func GetAllSessions(ctx context.Context) ([]*SessionType, error) {
+	return WithTxRtn(ctx, func(tx *TxWrap) ([]*SessionType, error) {
+		rtn := []*SessionType{}
+		tx.Select(&rtn, getAllSessionsQuery)
+		return rtn, nil
+	})
+}
+
+// Get all sessions and screens, including remotes
+func GetConnectUpdate(ctx context.Context) (*ConnectUpdate, error) {
+	return WithTxRtn(ctx, func(tx *TxWrap) (*ConnectUpdate, error) {
+		update := &ConnectUpdate{}
+		sessions := []*SessionType{}
+		tx.Select(&sessions, getAllSessionsQuery)
 		sessionMap := make(map[string]*SessionType)
-		for _, session := range update.Sessions {
+		for _, session := range sessions {
 			sessionMap[session.SessionId] = session
-			session.Full = true
+			update.Sessions = append(update.Sessions, session)
 		}
-		query = `SELECT * FROM screen ORDER BY archived, screenidx, archivedts`
-		update.Screens = dbutil.SelectMapsGen[*ScreenType](tx, query)
-		for _, screen := range update.Screens {
-			screen.Full = true
+		query := `SELECT * FROM screen ORDER BY archived, screenidx, archivedts`
+		screens := dbutil.SelectMapsGen[*ScreenType](tx, query)
+		for _, screen := range screens {
+			update.Screens = append(update.Screens, screen)
 		}
 		query = `SELECT * FROM remote_instance`
 		riArr := dbutil.SelectMapsGen[*RemoteInstance](tx, query)
@@ -486,19 +350,15 @@ func GetSessionScreens(ctx context.Context, sessionId string) ([]*ScreenType, er
 	return WithTxRtn(ctx, func(tx *TxWrap) ([]*ScreenType, error) {
 		query := `SELECT * FROM screen WHERE sessionid = ? ORDER BY archived, screenidx, archivedts`
 		rtn := dbutil.SelectMapsGen[*ScreenType](tx, query, sessionId)
-		for _, screen := range rtn {
-			screen.Full = true
-		}
 		return rtn, nil
 	})
 }
 
 func GetSessionById(ctx context.Context, id string) (*SessionType, error) {
-	allSessionsUpdate, err := GetAllSessions(ctx)
+	allSessions, err := GetAllSessions(ctx)
 	if err != nil {
 		return nil, err
 	}
-	allSessions := allSessionsUpdate.Sessions
 	for _, session := range allSessions {
 		if session.SessionId == id {
 			return session, nil
@@ -537,9 +397,9 @@ func GetSessionByName(ctx context.Context, name string) (*SessionType, error) {
 	return session, nil
 }
 
-// returns sessionId
+// returns (update, newSessionId, newScreenId, error)
 // if sessionName == "", it will be generated
-func InsertSessionWithName(ctx context.Context, sessionName string, activate bool) (*ModelUpdate, error) {
+func InsertSessionWithName(ctx context.Context, sessionName string, activate bool) (*scbus.ModelUpdatePacketType, string, string, error) {
 	var newScreen *ScreenType
 	newSessionId := scbase.GenWaveUUID()
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
@@ -553,7 +413,11 @@ func InsertSessionWithName(ctx context.Context, sessionName string, activate boo
 		if err != nil {
 			return err
 		}
-		newScreen = screenUpdate.Screens[0]
+		screenUpdateItems := scbus.GetUpdateItems[ScreenType](screenUpdate)
+		if len(screenUpdateItems) < 1 {
+			return fmt.Errorf("no screen update items")
+		}
+		newScreen = screenUpdateItems[0]
 		if activate {
 			query = `UPDATE client SET activesessionid = ?`
 			tx.Exec(query, newSessionId)
@@ -561,20 +425,19 @@ func InsertSessionWithName(ctx context.Context, sessionName string, activate boo
 		return nil
 	})
 	if txErr != nil {
-		return nil, txErr
+		return nil, "", "", txErr
 	}
 	session, err := GetSessionById(ctx, newSessionId)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
-	update := ModelUpdate{
-		Sessions: []*SessionType{session},
-		Screens:  []*ScreenType{newScreen},
-	}
+	update := scbus.MakeUpdatePacket()
+	update.AddUpdate(*session)
+	update.AddUpdate(*newScreen)
 	if activate {
-		update.ActiveSessionId = newSessionId
+		update.AddUpdate(ActiveSessionIdUpdate(newSessionId))
 	}
-	return &update, nil
+	return update, newSessionId, newScreen.ScreenId, nil
 }
 
 func SetActiveSessionId(ctx context.Context, sessionId string) error {
@@ -660,7 +523,7 @@ func fmtUniqueName(name string, defaultFmtStr string, startIdx int, strs []strin
 	}
 }
 
-func InsertScreen(ctx context.Context, sessionId string, origScreenName string, opts ScreenCreateOpts, activate bool) (*ModelUpdate, error) {
+func InsertScreen(ctx context.Context, sessionId string, origScreenName string, opts ScreenCreateOpts, activate bool) (*scbus.ModelUpdatePacketType, error) {
 	var newScreenId string
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
 		query := `SELECT sessionid FROM session WHERE sessionid = ? AND NOT archived`
@@ -710,12 +573,15 @@ func InsertScreen(ctx context.Context, sessionId string, origScreenName string, 
 			Archived:     false,
 			ArchivedTs:   0,
 		}
-		query = `INSERT INTO screen ( sessionid, screenid, name, screenidx, screenopts, ownerid, sharemode, webshareopts, curremoteownerid, curremoteid, curremotename, nextlinenum, selectedline, anchor, focustype, archived, archivedts)
-                             VALUES (:sessionid,:screenid,:name,:screenidx,:screenopts,:ownerid,:sharemode,:webshareopts,:curremoteownerid,:curremoteid,:curremotename,:nextlinenum,:selectedline,:anchor,:focustype,:archived,:archivedts)`
+		query = `INSERT INTO screen ( sessionid, screenid, name, screenidx, screenopts, screenviewopts, ownerid, sharemode, webshareopts, curremoteownerid, curremoteid, curremotename, nextlinenum, selectedline, anchor, focustype, archived, archivedts)
+                             VALUES (:sessionid,:screenid,:name,:screenidx,:screenopts,:screenviewopts,:ownerid,:sharemode,:webshareopts,:curremoteownerid,:curremoteid,:curremotename,:nextlinenum,:selectedline,:anchor,:focustype,:archived,:archivedts)`
 		tx.NamedExec(query, screen.ToMap())
 		if activate {
 			query = `UPDATE session SET activescreenid = ? WHERE sessionid = ?`
 			tx.Exec(query, newScreenId, sessionId)
+		}
+		if opts.RtnScreenId != nil {
+			*opts.RtnScreenId = newScreenId
 		}
 		return nil
 	})
@@ -726,13 +592,15 @@ func InsertScreen(ctx context.Context, sessionId string, origScreenName string, 
 	if err != nil {
 		return nil, err
 	}
-	update := &ModelUpdate{Screens: []*ScreenType{newScreen}}
+	update := scbus.MakeUpdatePacket()
+	update.AddUpdate(*newScreen)
 	if activate {
 		bareSession, err := GetBareSessionById(ctx, sessionId)
 		if err != nil {
 			return nil, txErr
 		}
-		update.Sessions = []*SessionType{bareSession}
+		update.AddUpdate(*bareSession)
+		UpdateWithCurrentOpenAICmdInfoChat(newScreenId, update)
 	}
 	return update, nil
 }
@@ -741,34 +609,41 @@ func GetScreenById(ctx context.Context, screenId string) (*ScreenType, error) {
 	return WithTxRtn(ctx, func(tx *TxWrap) (*ScreenType, error) {
 		query := `SELECT * FROM screen WHERE screenid = ?`
 		screen := dbutil.GetMapGen[*ScreenType](tx, query, screenId)
-		screen.Full = true
 		return screen, nil
 	})
 }
 
+// special "E" returns last unarchived line, "EA" returns last line (even if archived)
 func FindLineIdByArg(ctx context.Context, screenId string, lineArg string) (string, error) {
-	var lineId string
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
+	return WithTxRtn(ctx, func(tx *TxWrap) (string, error) {
+		if lineArg == "E" {
+			query := `SELECT lineid FROM line WHERE screenid = ? AND NOT archived ORDER BY linenum DESC LIMIT 1`
+			lineId := tx.GetString(query, screenId)
+			return lineId, nil
+		}
+		if lineArg == "EA" {
+			query := `SELECT lineid FROM line WHERE screenid = ? ORDER BY linenum DESC LIMIT 1`
+			lineId := tx.GetString(query, screenId)
+			return lineId, nil
+		}
 		lineNum, err := strconv.Atoi(lineArg)
 		if err == nil {
 			// valid linenum
 			query := `SELECT lineid FROM line WHERE screenid = ? AND linenum = ?`
-			lineId = tx.GetString(query, screenId, lineNum)
+			lineId := tx.GetString(query, screenId, lineNum)
+			return lineId, nil
 		} else if len(lineArg) == 8 {
 			// prefix id string match
 			query := `SELECT lineid FROM line WHERE screenid = ? AND substr(lineid, 1, 8) = ?`
-			lineId = tx.GetString(query, screenId, lineArg)
+			lineId := tx.GetString(query, screenId, lineArg)
+			return lineId, nil
 		} else {
 			// id match
 			query := `SELECT lineid FROM line WHERE screenid = ? AND lineid = ?`
-			lineId = tx.GetString(query, screenId, lineArg)
+			lineId := tx.GetString(query, screenId, lineArg)
+			return lineId, nil
 		}
-		return nil
 	})
-	if txErr != nil {
-		return "", txErr
-	}
-	return lineId, nil
 }
 
 func GetLineCmdByLineId(ctx context.Context, screenId string, lineId string) (*LineType, *CmdType, error) {
@@ -819,65 +694,125 @@ func InsertLine(ctx context.Context, line *LineType, cmd *CmdType) error {
 			cmd.OrigTermOpts = cmd.TermOpts
 			cmdMap := cmd.ToMap()
 			query = `
-INSERT INTO cmd  ( screenid, lineid, remoteownerid, remoteid, remotename, cmdstr, rawcmdstr, festate, statebasehash, statediffhasharr, termopts, origtermopts, status, cmdpid, remotepid, donets, exitcode, durationms, rtnstate, runout, rtnbasehash, rtndiffhasharr)
-          VALUES (:screenid,:lineid,:remoteownerid,:remoteid,:remotename,:cmdstr,:rawcmdstr,:festate,:statebasehash,:statediffhasharr,:termopts,:origtermopts,:status,:cmdpid,:remotepid,:donets,:exitcode,:durationms,:rtnstate,:runout,:rtnbasehash,:rtndiffhasharr)
+INSERT INTO cmd  ( screenid, lineid, remoteownerid, remoteid, remotename, cmdstr, rawcmdstr, festate, statebasehash, statediffhasharr, termopts, origtermopts, status, cmdpid, remotepid, donets, restartts, exitcode, durationms, rtnstate, runout, rtnbasehash, rtndiffhasharr)
+          VALUES (:screenid,:lineid,:remoteownerid,:remoteid,:remotename,:cmdstr,:rawcmdstr,:festate,:statebasehash,:statediffhasharr,:termopts,:origtermopts,:status,:cmdpid,:remotepid,:donets,:restartts,:exitcode,:durationms,:rtnstate,:runout,:rtnbasehash,:rtndiffhasharr)
 `
 			tx.NamedExec(query, cmdMap)
-		}
-		if isWebShare(tx, line.ScreenId) {
-			insertScreenLineUpdate(tx, line.ScreenId, line.LineId, UpdateType_LineNew)
 		}
 		return nil
 	})
 }
 
 func GetCmdByScreenId(ctx context.Context, screenId string, lineId string) (*CmdType, error) {
-	var cmd *CmdType
-	err := WithTx(ctx, func(tx *TxWrap) error {
+	return WithTxRtn(ctx, func(tx *TxWrap) (*CmdType, error) {
 		query := `SELECT * FROM cmd WHERE screenid = ? AND lineid = ?`
-		cmd = dbutil.GetMapGen[*CmdType](tx, query, screenId, lineId)
-		return nil
+		cmd := dbutil.GetMapGen[*CmdType](tx, query, screenId, lineId)
+		return cmd, nil
 	})
+}
+
+func UpdateWithClearOpenAICmdInfo(screenId string) *scbus.ModelUpdatePacketType {
+	ScreenMemClearCmdInfoChat(screenId)
+	return UpdateWithCurrentOpenAICmdInfoChat(screenId, nil)
+}
+
+func UpdateWithAddNewOpenAICmdInfoPacket(ctx context.Context, screenId string, pk *packet.OpenAICmdInfoChatMessage) *scbus.ModelUpdatePacketType {
+	ScreenMemAddCmdInfoChatMessage(screenId, pk)
+	return UpdateWithCurrentOpenAICmdInfoChat(screenId, nil)
+}
+
+func UpdateWithCurrentOpenAICmdInfoChat(screenId string, update *scbus.ModelUpdatePacketType) *scbus.ModelUpdatePacketType {
+	if update == nil {
+		update = scbus.MakeUpdatePacket()
+	}
+	update.AddUpdate(OpenAICmdInfoChatUpdate(ScreenMemGetCmdInfoChat(screenId).Messages))
+	return update
+}
+
+func UpdateWithUpdateOpenAICmdInfoPacket(ctx context.Context, screenId string, messageID int, pk *packet.OpenAICmdInfoChatMessage) (*scbus.ModelUpdatePacketType, error) {
+	err := ScreenMemUpdateCmdInfoChatMessage(screenId, messageID, pk)
 	if err != nil {
 		return nil, err
 	}
-	return cmd, nil
+	return UpdateWithCurrentOpenAICmdInfoChat(screenId, nil), nil
 }
 
-func UpdateCmdDoneInfo(ctx context.Context, ck base.CommandKey, donePk *packet.CmdDonePacketType, status string) (*ModelUpdate, error) {
-	if donePk == nil {
-		return nil, fmt.Errorf("invalid cmddone packet")
-	}
+func UpdateCmdForRestart(ctx context.Context, ck base.CommandKey, ts int64, cmdPid int, remotePid int, termOpts *TermOpts) error {
+	return WithTx(ctx, func(tx *TxWrap) error {
+		query := `UPDATE cmd
+		          SET restartts = ?, status = ?, exitcode = ?, cmdpid = ?, remotepid = ?, durationms = ?, termopts = ?, origtermopts = ?
+				  WHERE screenid = ? AND lineid = ?`
+		tx.Exec(query, ts, CmdStatusRunning, 0, cmdPid, remotePid, 0, quickJson(termOpts), quickJson(termOpts), ck.GetGroupId(), lineIdFromCK(ck))
+		query = `UPDATE history
+		         SET ts = ?, status = ?, exitcode = ?, durationms = ?
+			     WHERE screenid = ? AND lineid = ?`
+		tx.Exec(query, ts, CmdStatusRunning, 0, 0, ck.GetGroupId(), lineIdFromCK(ck))
+		return nil
+	})
+}
+
+func UpdateCmdStartInfo(ctx context.Context, ck base.CommandKey, cmdPid int, waveshellPid int) error {
+	return WithTx(ctx, func(tx *TxWrap) error {
+		query := `UPDATE cmd SET cmdpid = ?, remotepid = ? WHERE screenid = ? AND lineid = ?`
+		tx.Exec(query, cmdPid, waveshellPid, ck.GetGroupId(), lineIdFromCK(ck))
+		return nil
+	})
+}
+
+type CmdDoneDataValues struct {
+	Ts         int64
+	ExitCode   int
+	DurationMs int64
+}
+
+func UpdateCmdDoneInfo(ctx context.Context, update *scbus.ModelUpdatePacketType, ck base.CommandKey, donePk CmdDoneDataValues, status string) error {
 	if ck.IsEmpty() {
-		return nil, fmt.Errorf("cannot update cmddoneinfo, empty ck")
+		return fmt.Errorf("cannot update cmddoneinfo, empty ck")
 	}
 	screenId := ck.GetGroupId()
 	var rtnCmd *CmdType
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
+		lineId := lineIdFromCK(ck)
 		query := `UPDATE cmd SET status = ?, donets = ?, exitcode = ?, durationms = ? WHERE screenid = ? AND lineid = ?`
-		tx.Exec(query, status, donePk.Ts, donePk.ExitCode, donePk.DurationMs, screenId, lineIdFromCK(ck))
+		tx.Exec(query, status, donePk.Ts, donePk.ExitCode, donePk.DurationMs, screenId, lineId)
+		query = `UPDATE history SET status = ?, exitcode = ?, durationms = ? WHERE screenid = ? AND lineid = ?`
+		tx.Exec(query, status, donePk.ExitCode, donePk.DurationMs, screenId, lineId)
 		var err error
-		rtnCmd, err = GetCmdByScreenId(tx.Context(), screenId, lineIdFromCK(ck))
+		rtnCmd, err = GetCmdByScreenId(tx.Context(), screenId, lineId)
 		if err != nil {
 			return err
 		}
 		if isWebShare(tx, screenId) {
-			insertScreenLineUpdate(tx, screenId, lineIdFromCK(ck), UpdateType_CmdExitCode)
-			insertScreenLineUpdate(tx, screenId, lineIdFromCK(ck), UpdateType_CmdDurationMs)
-			insertScreenLineUpdate(tx, screenId, lineIdFromCK(ck), UpdateType_CmdStatus)
+			insertScreenLineUpdate(tx, screenId, lineId, UpdateType_CmdExitCode)
+			insertScreenLineUpdate(tx, screenId, lineId, UpdateType_CmdDurationMs)
+			insertScreenLineUpdate(tx, screenId, lineId, UpdateType_CmdStatus)
 		}
 		return nil
 	})
 	if txErr != nil {
-		return nil, txErr
+		return txErr
 	}
 	if rtnCmd == nil {
-		return nil, fmt.Errorf("cmd data not found for ck[%s]", ck)
+		return fmt.Errorf("cmd data not found for ck[%s]", ck)
 	}
-	return &ModelUpdate{Cmd: rtnCmd}, nil
+	update.AddUpdate(*rtnCmd)
+	// Update in-memory screen indicator status
+	var indicator StatusIndicatorLevel
+	if rtnCmd.ExitCode == 0 {
+		indicator = StatusIndicatorLevel_Success
+	} else {
+		indicator = StatusIndicatorLevel_Error
+	}
+	err := SetStatusIndicatorLevel_Update(ctx, update, screenId, indicator, false)
+	if err != nil {
+		// This is not a fatal error, so just log it
+		log.Printf("error setting status indicator level after done packet: %v\n", err)
+	}
+	go IncrementNumRunningCmds(screenId, -1)
+	return nil
 }
 
-func UpdateCmdRtnState(ctx context.Context, ck base.CommandKey, statePtr ShellStatePtr) error {
+func UpdateCmdRtnState(ctx context.Context, ck base.CommandKey, statePtr packet.ShellStatePtr) error {
 	if ck.IsEmpty() {
 		return fmt.Errorf("cannot update cmdrtnstate, empty ck")
 	}
@@ -895,18 +830,6 @@ func UpdateCmdRtnState(ctx context.Context, ck base.CommandKey, statePtr ShellSt
 		return txErr
 	}
 	return nil
-}
-
-func AppendCmdErrorPk(ctx context.Context, errPk *packet.CmdErrorPacketType) error {
-	if errPk == nil || errPk.CK.IsEmpty() {
-		return fmt.Errorf("invalid cmderror packet (no ck)")
-	}
-	screenId := errPk.CK.GetGroupId()
-	return WithTx(ctx, func(tx *TxWrap) error {
-		query := `UPDATE cmd SET runout = json_insert(runout, '$[#]', ?) WHERE screenid = ? AND lineid = ?`
-		tx.Exec(query, quickJson(errPk), screenId, lineIdFromCK(errPk.CK))
-		return nil
-	})
 }
 
 func ReInitFocus(ctx context.Context) error {
@@ -928,6 +851,8 @@ func HangupAllRunningCmds(ctx context.Context) error {
 			if isWebShare(tx, cmdPtr.ScreenId) {
 				insertScreenLineUpdate(tx, cmdPtr.ScreenId, cmdPtr.LineId, UpdateType_CmdStatus)
 			}
+			query = `UPDATE history SET status = ? WHERE screenid = ? AND lineid = ?`
+			tx.Exec(query, CmdStatusHangup, cmdPtr.ScreenId, cmdPtr.LineId)
 		}
 		return nil
 	})
@@ -946,10 +871,13 @@ func HangupRunningCmdsByRemoteId(ctx context.Context, remoteId string) ([]*Scree
 			if isWebShare(tx, cmdPtr.ScreenId) {
 				insertScreenLineUpdate(tx, cmdPtr.ScreenId, cmdPtr.LineId, UpdateType_CmdStatus)
 			}
+			query = `UPDATE history SET status = ? WHERE screenid = ? AND lineid = ?`
+			tx.Exec(query, CmdStatusHangup, cmdPtr.ScreenId, cmdPtr.LineId)
 			screen, err := UpdateScreenFocusForDoneCmd(tx.Context(), cmdPtr.ScreenId, cmdPtr.LineId)
 			if err != nil {
 				return nil, err
 			}
+			// this doesn't add dups because UpdateScreenFocusForDoneCmd will only return a screen once
 			if screen != nil {
 				rtn = append(rtn, screen)
 			}
@@ -962,6 +890,8 @@ func HangupRunningCmdsByRemoteId(ctx context.Context, remoteId string) ([]*Scree
 func HangupCmd(ctx context.Context, ck base.CommandKey) (*ScreenType, error) {
 	return WithTxRtn(ctx, func(tx *TxWrap) (*ScreenType, error) {
 		query := `UPDATE cmd SET status = ? WHERE screenid = ? AND lineid = ?`
+		tx.Exec(query, CmdStatusHangup, ck.GetGroupId(), lineIdFromCK(ck))
+		query = `UPDATE history SET status = ? WHERE screenid = ? AND lineid = ?`
 		tx.Exec(query, CmdStatusHangup, ck.GetGroupId(), lineIdFromCK(ck))
 		if isWebShare(tx, ck.GetGroupId()) {
 			insertScreenLineUpdate(tx, ck.GetGroupId(), lineIdFromCK(ck), UpdateType_CmdStatus)
@@ -998,7 +928,8 @@ func getNextId(ids []string, delId string) string {
 	return ids[0]
 }
 
-func SwitchScreenById(ctx context.Context, sessionId string, screenId string) (*ModelUpdate, error) {
+func SwitchScreenById(ctx context.Context, sessionId string, screenId string) (*scbus.ModelUpdatePacketType, error) {
+	SetActiveSessionId(ctx, sessionId)
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
 		query := `SELECT screenid FROM screen WHERE sessionid = ? AND screenid = ?`
 		if !tx.Exists(query, sessionId, screenId) {
@@ -1015,7 +946,22 @@ func SwitchScreenById(ctx context.Context, sessionId string, screenId string) (*
 	if err != nil {
 		return nil, err
 	}
-	return &ModelUpdate{ActiveSessionId: sessionId, Sessions: []*SessionType{bareSession}}, nil
+	update := scbus.MakeUpdatePacket()
+	update.AddUpdate(ActiveSessionIdUpdate(sessionId))
+	update.AddUpdate(*bareSession)
+	memState := GetScreenMemState(screenId)
+	if memState != nil {
+		update.AddUpdate(CmdLineUpdate(memState.CmdInputText))
+		UpdateWithCurrentOpenAICmdInfoChat(screenId, update)
+
+		// Clear any previous status indicator for this screen
+		err := ResetStatusIndicator_Update(update, screenId)
+		if err != nil {
+			// This is not a fatal error, so just log it
+			log.Printf("error resetting status indicator when switching screens: %v\n", err)
+		}
+	}
+	return update, nil
 }
 
 // screen may not exist at this point (so don't query screen table)
@@ -1037,7 +983,7 @@ func cleanScreenCmds(ctx context.Context, screenId string) error {
 	return nil
 }
 
-func ArchiveScreen(ctx context.Context, sessionId string, screenId string) (UpdatePacket, error) {
+func ArchiveScreen(ctx context.Context, sessionId string, screenId string) (scbus.UpdatePacket, error) {
 	var isActive bool
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
 		query := `SELECT screenid FROM screen WHERE sessionid = ? AND screenid = ?`
@@ -1074,13 +1020,14 @@ func ArchiveScreen(ctx context.Context, sessionId string, screenId string) (Upda
 	if err != nil {
 		return nil, fmt.Errorf("cannot retrive archived screen: %w", err)
 	}
-	update := &ModelUpdate{Screens: []*ScreenType{newScreen}}
+	update := scbus.MakeUpdatePacket()
+	update.AddUpdate(*newScreen)
 	if isActive {
 		bareSession, err := GetBareSessionById(ctx, sessionId)
 		if err != nil {
 			return nil, err
 		}
-		update.Sessions = []*SessionType{bareSession}
+		update.AddUpdate(*bareSession)
 	}
 	return update, nil
 }
@@ -1099,25 +1046,25 @@ func UnArchiveScreen(ctx context.Context, sessionId string, screenId string) err
 	return txErr
 }
 
-func PurgeScreen(ctx context.Context, screenId string, sessionDel bool) (UpdatePacket, error) {
+// if sessionDel is passed, we do *not* delete the screen directory (session delete will handle that)
+func DeleteScreen(ctx context.Context, screenId string, sessionDel bool, update *scbus.ModelUpdatePacketType) (*scbus.ModelUpdatePacketType, error) {
 	var sessionId string
 	var isActive bool
+	var screenTombstone *ScreenTombstoneType
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT screenid FROM screen WHERE screenid = ?`
-		if !tx.Exists(query, screenId) {
-			return fmt.Errorf("cannot purge screen (not found)")
+		screen, err := GetScreenById(tx.Context(), screenId)
+		if err != nil {
+			return fmt.Errorf("cannot get screen to delete: %w", err)
+		}
+		if screen == nil {
+			return fmt.Errorf("cannot delete screen (not found)")
 		}
 		webSharing := isWebShare(tx, screenId)
 		if !sessionDel {
-			query = `SELECT sessionid FROM screen WHERE screenid = ?`
+			query := `SELECT sessionid FROM screen WHERE screenid = ?`
 			sessionId = tx.GetString(query, screenId)
 			if sessionId == "" {
-				return fmt.Errorf("cannot purge screen (no sessionid)")
-			}
-			query = `SELECT count(*) FROM screen WHERE sessionid = ? AND NOT archived`
-			numScreens := tx.GetInt(query, sessionId)
-			if numScreens <= 1 {
-				return fmt.Errorf("cannot purge the last screen in a session")
+				return fmt.Errorf("cannot delete screen (no sessionid)")
 			}
 			isActive = tx.Exists(`SELECT sessionid FROM session WHERE sessionid = ? AND activescreenid = ?`, sessionId, screenId)
 			if isActive {
@@ -1126,13 +1073,23 @@ func PurgeScreen(ctx context.Context, screenId string, sessionDel bool) (UpdateP
 				tx.Exec(`UPDATE session SET activescreenid = ? WHERE sessionid = ?`, nextId, sessionId)
 			}
 		}
+		screenTombstone = &ScreenTombstoneType{
+			ScreenId:   screen.ScreenId,
+			SessionId:  screen.SessionId,
+			Name:       screen.Name,
+			DeletedTs:  time.Now().UnixMilli(),
+			ScreenOpts: screen.ScreenOpts,
+		}
+		query := `INSERT INTO screen_tombstone ( screenid, sessionid, name, deletedts, screenopts)
+		                                VALUES (:screenid,:sessionid,:name,:deletedts,:screenopts)`
+		tx.NamedExec(query, dbutil.ToDBMap(screenTombstone, false))
 		query = `DELETE FROM screen WHERE screenid = ?`
-		tx.Exec(query, screenId)
-		query = `DELETE FROM history WHERE screenid = ?`
 		tx.Exec(query, screenId)
 		query = `DELETE FROM line WHERE screenid = ?`
 		tx.Exec(query, screenId)
 		query = `DELETE FROM cmd WHERE screenid = ?`
+		tx.Exec(query, screenId)
+		query = `UPDATE history SET lineid = '', linenum = 0 WHERE screenid = ?`
 		tx.Exec(query, screenId)
 		if webSharing {
 			insertScreenDelUpdate(tx, screenId)
@@ -1142,26 +1099,25 @@ func PurgeScreen(ctx context.Context, screenId string, sessionDel bool) (UpdateP
 	if txErr != nil {
 		return nil, txErr
 	}
-	delErr := DeleteScreenDir(ctx, screenId)
-	if delErr != nil {
-		log.Printf("error removing screendir")
+	if !sessionDel {
+		GoDeleteScreenDirs(screenId)
 	}
-	if sessionDel {
-		return nil, nil
+	if update == nil {
+		update = scbus.MakeUpdatePacket()
 	}
-	update := &ModelUpdate{}
-	update.Screens = []*ScreenType{&ScreenType{SessionId: sessionId, ScreenId: screenId, Remove: true}}
+	update.AddUpdate(*screenTombstone)
+	update.AddUpdate(ScreenType{SessionId: sessionId, ScreenId: screenId, Remove: true})
 	if isActive {
 		bareSession, err := GetBareSessionById(ctx, sessionId)
 		if err != nil {
 			return nil, err
 		}
-		update.Sessions = []*SessionType{bareSession}
+		update.AddUpdate(*bareSession)
 	}
 	return update, nil
 }
 
-func GetRemoteState(ctx context.Context, sessionId string, screenId string, remotePtr RemotePtrType) (*packet.ShellState, *ShellStatePtr, error) {
+func GetRemoteState(ctx context.Context, sessionId string, screenId string, remotePtr RemotePtrType) (*packet.ShellState, *packet.ShellStatePtr, error) {
 	ssptr, err := GetRemoteStatePtr(ctx, sessionId, screenId, remotePtr)
 	if err != nil {
 		return nil, nil, err
@@ -1176,8 +1132,8 @@ func GetRemoteState(ctx context.Context, sessionId string, screenId string, remo
 	return state, ssptr, err
 }
 
-func GetRemoteStatePtr(ctx context.Context, sessionId string, screenId string, remotePtr RemotePtrType) (*ShellStatePtr, error) {
-	var ssptr *ShellStatePtr
+func GetRemoteStatePtr(ctx context.Context, sessionId string, screenId string, remotePtr RemotePtrType) (*packet.ShellStatePtr, error) {
+	var ssptr *packet.ShellStatePtr
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
 		ri, err := GetRemoteInstance(tx.Context(), sessionId, screenId, remotePtr)
 		if err != nil {
@@ -1186,7 +1142,7 @@ func GetRemoteStatePtr(ctx context.Context, sessionId string, screenId string, r
 		if ri == nil {
 			return nil
 		}
-		ssptr = &ShellStatePtr{ri.StateBaseHash, ri.StateDiffHashArr}
+		ssptr = &packet.ShellStatePtr{ri.StateBaseHash, ri.StateDiffHashArr}
 		return nil
 	})
 	if txErr != nil {
@@ -1227,11 +1183,12 @@ func GetRemoteInstance(ctx context.Context, sessionId string, screenId string, r
 	return ri, nil
 }
 
-// internal function for UpdateRemoteState
+// internal function for UpdateRemoteState (sets StateBaseHash, StateDiffHashArr, and ShellType)
 func updateRIWithState(ctx context.Context, ri *RemoteInstance, stateBase *packet.ShellState, stateDiff *packet.ShellStateDiff) error {
 	if stateBase != nil {
 		ri.StateBaseHash = stateBase.GetHashVal(false)
 		ri.StateDiffHashArr = nil
+		ri.ShellType = stateBase.GetShellType()
 		err := StoreStateBase(ctx, stateBase)
 		if err != nil {
 			return err
@@ -1239,6 +1196,7 @@ func updateRIWithState(ctx context.Context, ri *RemoteInstance, stateBase *packe
 	} else if stateDiff != nil {
 		ri.StateBaseHash = stateDiff.BaseHash
 		ri.StateDiffHashArr = append(stateDiff.DiffHashArr, stateDiff.GetHashVal(false))
+		ri.ShellType = stateDiff.GetShellType()
 		err := StoreStateDiff(ctx, stateDiff)
 		if err != nil {
 			return err
@@ -1279,18 +1237,18 @@ func UpdateRemoteState(ctx context.Context, sessionId string, screenId string, r
 			if err != nil {
 				return err
 			}
-			query = `INSERT INTO remote_instance ( riid, name, sessionid, screenid, remoteownerid, remoteid, festate, statebasehash, statediffhasharr)
-                                          VALUES (:riid,:name,:sessionid,:screenid,:remoteownerid,:remoteid,:festate,:statebasehash,:statediffhasharr)`
+			query = `INSERT INTO remote_instance ( riid, name, sessionid, screenid, remoteownerid, remoteid, festate, statebasehash, statediffhasharr, shelltype)
+                                          VALUES (:riid,:name,:sessionid,:screenid,:remoteownerid,:remoteid,:festate,:statebasehash,:statediffhasharr,:shelltype)`
 			tx.NamedExec(query, ri.ToMap())
 			return nil
 		} else {
-			query = `UPDATE remote_instance SET festate = ?, statebasehash = ?, statediffhasharr = ? WHERE riid = ?`
+			query = `UPDATE remote_instance SET festate = ?, statebasehash = ?, statediffhasharr = ?, shelltype = ? WHERE riid = ?`
 			ri.FeState = feState
 			err = updateRIWithState(tx.Context(), ri, stateBase, stateDiff)
 			if err != nil {
 				return err
 			}
-			tx.Exec(query, quickJson(ri.FeState), ri.StateBaseHash, quickJsonArr(ri.StateDiffHashArr), ri.RIId)
+			tx.Exec(query, quickJson(ri.FeState), ri.StateBaseHash, quickJsonArr(ri.StateDiffHashArr), ri.ShellType, ri.RIId)
 			return nil
 		}
 	})
@@ -1385,7 +1343,7 @@ func SetScreenName(ctx context.Context, sessionId string, screenId string, name 
 	return txErr
 }
 
-func ArchiveScreenLines(ctx context.Context, screenId string) (*ModelUpdate, error) {
+func ArchiveScreenLines(ctx context.Context, screenId string) (*scbus.ModelUpdatePacketType, error) {
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
 		query := `SELECT screenid FROM screen WHERE screenid = ?`
 		if !tx.Exists(query, screenId) {
@@ -1404,26 +1362,34 @@ func ArchiveScreenLines(ctx context.Context, screenId string) (*ModelUpdate, err
 	if err != nil {
 		return nil, err
 	}
-	return &ModelUpdate{ScreenLines: screenLines}, nil
+	ret := scbus.MakeUpdatePacket()
+	ret.AddUpdate(*screenLines)
+	return ret, nil
 }
 
-func PurgeScreenLines(ctx context.Context, screenId string) (*ModelUpdate, error) {
+func DeleteScreenLines(ctx context.Context, screenId string) (*scbus.ModelUpdatePacketType, error) {
 	var lineIds []string
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT lineid FROM line WHERE screenid = ?`
-		lineIds = tx.SelectStrings(query, screenId)
-		query = `DELETE FROM line WHERE screenid = ?`
-		tx.Exec(query, screenId)
-		query = `DELETE FROM history WHERE screenid = ?`
-		tx.Exec(query, screenId)
-		query = `UPDATE screen SET nextlinenum = 1 WHERE screenid = ?`
-		tx.Exec(query, screenId)
+		query := `SELECT lineid FROM line 
+		          WHERE screenid = ?
+		            AND NOT EXISTS (SELECT lineid FROM cmd c WHERE c.screenid = ? AND c.lineid = line.lineid AND c.status IN ('running', 'detached'))`
+		lineIds = tx.SelectStrings(query, screenId, screenId)
+		query = `DELETE FROM line 
+				 WHERE screenid = ? AND lineid IN (SELECT value FROM json_each(?))`
+		tx.Exec(query, screenId, quickJsonArr(lineIds))
+		query = `UPDATE history SET lineid = '', linenum = 0 
+		         WHERE screenid = ? AND lineid IN (SELECT value FROM json_each(?))`
+		tx.Exec(query, screenId, quickJsonArr(lineIds))
 		return nil
 	})
 	if txErr != nil {
 		return nil, txErr
 	}
-	go cleanScreenCmds(context.Background(), screenId)
+	go func() {
+		cleanCtx, cancelFn := context.WithTimeout(context.Background(), time.Minute)
+		defer cancelFn()
+		cleanScreenCmds(cleanCtx, screenId)
+	}()
 	screen, err := GetScreenById(ctx, screenId)
 	if err != nil {
 		return nil, err
@@ -1440,7 +1406,10 @@ func PurgeScreenLines(ctx context.Context, screenId string) (*ModelUpdate, error
 		}
 		screenLines.Lines = append(screenLines.Lines, line)
 	}
-	return &ModelUpdate{Screens: []*ScreenType{screen}, ScreenLines: screenLines}, nil
+	ret := scbus.MakeUpdatePacket()
+	ret.AddUpdate(*screen)
+	ret.AddUpdate(*screenLines)
+	return ret, nil
 }
 
 func GetRunningScreenCmds(ctx context.Context, screenId string) ([]*CmdType, error) {
@@ -1487,37 +1456,50 @@ func ScreenReset(ctx context.Context, screenId string) ([]*RemoteInstance, error
 	})
 }
 
-func PurgeSession(ctx context.Context, sessionId string) (UpdatePacket, error) {
+func DeleteSession(ctx context.Context, sessionId string) (scbus.UpdatePacket, error) {
 	var newActiveSessionId string
 	var screenIds []string
+	var sessionTombstone *SessionTombstoneType
+	update := scbus.MakeUpdatePacket()
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT sessionid FROM session WHERE sessionid = ?`
-		if !tx.Exists(query, sessionId) {
-			return fmt.Errorf("session does not exist")
+		bareSession, err := GetBareSessionById(tx.Context(), sessionId)
+		if err != nil {
+			return fmt.Errorf("cannot get session to delete: %w", err)
 		}
-		query = `SELECT screenid FROM screen WHERE sessionid = ?`
+		if bareSession == nil {
+			return fmt.Errorf("cannot delete session (not found)")
+		}
+		query := `SELECT screenid FROM screen WHERE sessionid = ?`
 		screenIds = tx.SelectStrings(query, sessionId)
 		for _, screenId := range screenIds {
-			_, err := PurgeScreen(tx.Context(), screenId, true)
+			_, err := DeleteScreen(tx.Context(), screenId, true, update)
 			if err != nil {
-				return fmt.Errorf("error purging screen[%s]: %v", screenId, err)
+				return fmt.Errorf("error deleting screen[%s]: %v", screenId, err)
 			}
 		}
 		query = `DELETE FROM session WHERE sessionid = ?`
 		tx.Exec(query, sessionId)
 		newActiveSessionId, _ = fixActiveSessionId(tx.Context())
+		sessionTombstone = &SessionTombstoneType{
+			SessionId: sessionId,
+			Name:      bareSession.Name,
+			DeletedTs: time.Now().UnixMilli(),
+		}
+		query = `INSERT INTO session_tombstone ( sessionid, name, deletedts)
+		                                VALUES (:sessionid,:name,:deletedts)`
+		tx.NamedExec(query, dbutil.ToDBMap(sessionTombstone, false))
 		return nil
 	})
 	if txErr != nil {
 		return nil, txErr
 	}
-	update := &ModelUpdate{}
+	GoDeleteScreenDirs(screenIds...)
 	if newActiveSessionId != "" {
-		update.ActiveSessionId = newActiveSessionId
+		update.AddUpdate(ActiveSessionIdUpdate(newActiveSessionId))
 	}
-	update.Sessions = append(update.Sessions, &SessionType{SessionId: sessionId, Remove: true})
-	for _, screenId := range screenIds {
-		update.Screens = append(update.Screens, &ScreenType{ScreenId: screenId, Remove: true})
+	update.AddUpdate(SessionType{SessionId: sessionId, Remove: true})
+	if sessionTombstone != nil {
+		update.AddUpdate(*sessionTombstone)
 	}
 	return update, nil
 }
@@ -1544,7 +1526,7 @@ func fixActiveSessionId(ctx context.Context) (string, error) {
 	return newActiveSessionId, nil
 }
 
-func ArchiveSession(ctx context.Context, sessionId string) (*ModelUpdate, error) {
+func ArchiveSession(ctx context.Context, sessionId string) (*scbus.ModelUpdatePacketType, error) {
 	if sessionId == "" {
 		return nil, fmt.Errorf("invalid blank sessionid")
 	}
@@ -1568,17 +1550,17 @@ func ArchiveSession(ctx context.Context, sessionId string) (*ModelUpdate, error)
 		return nil, txErr
 	}
 	bareSession, _ := GetBareSessionById(ctx, sessionId)
-	update := &ModelUpdate{}
+	update := scbus.MakeUpdatePacket()
 	if bareSession != nil {
-		update.Sessions = append(update.Sessions, bareSession)
+		update.AddUpdate(*bareSession)
 	}
 	if newActiveSessionId != "" {
-		update.ActiveSessionId = newActiveSessionId
+		update.AddUpdate(ActiveSessionIdUpdate(newActiveSessionId))
 	}
 	return update, nil
 }
 
-func UnArchiveSession(ctx context.Context, sessionId string, activate bool) (*ModelUpdate, error) {
+func UnArchiveSession(ctx context.Context, sessionId string, activate bool) (*scbus.ModelUpdatePacketType, error) {
 	if sessionId == "" {
 		return nil, fmt.Errorf("invalid blank sessionid")
 	}
@@ -1604,12 +1586,13 @@ func UnArchiveSession(ctx context.Context, sessionId string, activate bool) (*Mo
 		return nil, txErr
 	}
 	bareSession, _ := GetBareSessionById(ctx, sessionId)
-	update := &ModelUpdate{}
+	update := scbus.MakeUpdatePacket()
+
 	if bareSession != nil {
-		update.Sessions = append(update.Sessions, bareSession)
+		update.AddUpdate(*bareSession)
 	}
 	if activate {
-		update.ActiveSessionId = sessionId
+		update.AddUpdate(ActiveSessionIdUpdate(sessionId))
 	}
 	return update, nil
 }
@@ -1648,9 +1631,11 @@ const (
 	RemoteField_SSHKey      = "sshkey"      // string
 	RemoteField_SSHPassword = "sshpassword" // string
 	RemoteField_Color       = "color"       // string
+	RemoteField_ShellPref   = "shellpref"   // string
 )
 
 // editMap: alias, connectmode, autoinstall, sshkey, color, sshpassword (from constants)
+// note that all validation should have already happened outside of this function
 func UpdateRemote(ctx context.Context, remoteId string, editMap map[string]interface{}) (*RemoteType, error) {
 	var rtn *RemoteType
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
@@ -1677,6 +1662,10 @@ func UpdateRemote(ctx context.Context, remoteId string, editMap map[string]inter
 		if sshPassword, found := editMap[RemoteField_SSHPassword]; found {
 			query = `UPDATE remote SET sshopts = json_set(sshopts, '$.sshpassword', ?) WHERE remoteid = ?`
 			tx.Exec(query, sshPassword, remoteId)
+		}
+		if shellPref, found := editMap[RemoteField_ShellPref]; found {
+			query = `UPDATE remote SET shellpref = ? WHERE remoteid = ?`
+			tx.Exec(query, shellPref, remoteId)
 		}
 		if color, found := editMap[RemoteField_Color]; found {
 			query = `UPDATE remote SET remoteopts = json_set(remoteopts, '$.color', ?) WHERE remoteid = ?`
@@ -1762,6 +1751,14 @@ func UpdateScreen(ctx context.Context, screenId string, editMap map[string]inter
 		return nil, txErr
 	}
 	return GetScreenById(ctx, screenId)
+}
+
+func ScreenUpdateViewOpts(ctx context.Context, screenId string, viewOpts ScreenViewOptsType) error {
+	return WithTx(ctx, func(tx *TxWrap) error {
+		query := `UPDATE screen SET screenviewopts = ? WHERE screenid = ?`
+		tx.Exec(query, quickJson(viewOpts), screenId)
+		return nil
+	})
 }
 
 func GetLineResolveItems(ctx context.Context, screenId string) ([]ResolveItem, error) {
@@ -1850,8 +1847,73 @@ func StoreStateDiff(ctx context.Context, diff *packet.ShellStateDiff) error {
 	return nil
 }
 
+func GetStateBaseVersion(ctx context.Context, baseHash string) (string, error) {
+	return WithTxRtn(ctx, func(tx *TxWrap) (string, error) {
+		query := `SELECT version FROM state_base WHERE basehash = ?`
+		rtn := tx.GetString(query, baseHash)
+		return rtn, nil
+	})
+}
+
+func GetCurStateDiffFromPtr(ctx context.Context, ssPtr *packet.ShellStatePtr) (*packet.ShellStateDiff, error) {
+	if ssPtr == nil {
+		return nil, fmt.Errorf("cannot resolve state, empty stateptr")
+	}
+	if len(ssPtr.DiffHashArr) == 0 {
+		baseVersion, err := GetStateBaseVersion(ctx, ssPtr.BaseHash)
+		if err != nil {
+			return nil, fmt.Errorf("cannot get base version: %v", err)
+		}
+		// return an empty diff
+		return &packet.ShellStateDiff{Version: baseVersion, BaseHash: ssPtr.BaseHash}, nil
+	}
+	lastDiffHash := ssPtr.DiffHashArr[len(ssPtr.DiffHashArr)-1]
+	return GetStateDiff(ctx, lastDiffHash)
+}
+
+func GetStateBase(ctx context.Context, baseHash string) (*packet.ShellState, error) {
+	stateBase, txErr := WithTxRtn(ctx, func(tx *TxWrap) (*StateBase, error) {
+		var stateBase StateBase
+		query := `SELECT * FROM state_base WHERE basehash = ?`
+		found := tx.Get(&stateBase, query, baseHash)
+		if !found {
+			return nil, fmt.Errorf("StateBase %s not found", baseHash)
+		}
+		return &stateBase, nil
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	state := &packet.ShellState{}
+	err := state.DecodeShellState(stateBase.Data)
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func GetStateDiff(ctx context.Context, diffHash string) (*packet.ShellStateDiff, error) {
+	stateDiff, txErr := WithTxRtn(ctx, func(tx *TxWrap) (*StateDiff, error) {
+		query := `SELECT * FROM state_diff WHERE diffhash = ?`
+		stateDiff := dbutil.GetMapGen[*StateDiff](tx, query, diffHash)
+		if stateDiff == nil {
+			return nil, fmt.Errorf("StateDiff %s not found", diffHash)
+		}
+		return stateDiff, nil
+	})
+	if txErr != nil {
+		return nil, txErr
+	}
+	state := &packet.ShellStateDiff{}
+	err := state.DecodeShellStateDiff(stateDiff.Data)
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
 // returns error when not found
-func GetFullState(ctx context.Context, ssPtr ShellStatePtr) (*packet.ShellState, error) {
+func GetFullState(ctx context.Context, ssPtr packet.ShellStatePtr) (*packet.ShellState, error) {
 	var state *packet.ShellState
 	if ssPtr.BaseHash == "" {
 		return nil, fmt.Errorf("invalid empty basehash")
@@ -1868,22 +1930,26 @@ func GetFullState(ctx context.Context, ssPtr ShellStatePtr) (*packet.ShellState,
 		if err != nil {
 			return err
 		}
+		sapi, err := shellapi.MakeShellApi(state.GetShellType())
+		if err != nil {
+			return err
+		}
 		for idx, diffHash := range ssPtr.DiffHashArr {
 			query = `SELECT * FROM state_diff WHERE diffhash = ?`
 			stateDiff := dbutil.GetMapGen[*StateDiff](tx, query, diffHash)
 			if stateDiff == nil {
 				return fmt.Errorf("ShellStateDiff %s not found", diffHash)
 			}
-			var ssDiff packet.ShellStateDiff
+			ssDiff := &packet.ShellStateDiff{}
 			err = ssDiff.DecodeShellStateDiff(stateDiff.Data)
 			if err != nil {
 				return err
 			}
-			newState, err := shexec.ApplyShellStateDiff(*state, ssDiff)
+			newState, err := sapi.ApplyShellStateDiff(state, ssDiff)
 			if err != nil {
 				return fmt.Errorf("GetFullState, diff[%d]:%s: %v", idx, diffHash, err)
 			}
-			state = &newState
+			state = newState
 		}
 		return nil
 	})
@@ -1974,31 +2040,58 @@ func SetLineArchivedById(ctx context.Context, screenId string, lineId string, ar
 	return txErr
 }
 
-func purgeCmdByScreenId(ctx context.Context, screenId string, lineId string) error {
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `DELETE FROM cmd WHERE screenid = ? AND lineid = ?`
-		tx.Exec(query, screenId, lineId)
-		if tx.Err != nil {
-			// short circuit here because we don't want to delete the ptyfile when the tx will be rolled back
-			return tx.Err
+func GetScreenSelectedLineId(ctx context.Context, screenId string) (string, error) {
+	return WithTxRtn(ctx, func(tx *TxWrap) (string, error) {
+		query := `SELECT selectedline FROM screen WHERE screenid = ?`
+		sline := tx.GetInt(query, screenId)
+		if sline <= 0 {
+			return "", nil
 		}
-		return DeletePtyOutFile(tx.Context(), screenId, lineId)
+		query = `SELECT lineid FROM line WHERE screenid = ? AND linenum = ?`
+		lineId := tx.GetString(query, screenId, sline)
+		return lineId, nil
 	})
-	return txErr
 }
 
-func PurgeLinesByIds(ctx context.Context, screenId string, lineIds []string) error {
+// returns updated screen (only if updated)
+func FixupScreenSelectedLine(ctx context.Context, screenId string) (*ScreenType, error) {
+	return WithTxRtn(ctx, func(tx *TxWrap) (*ScreenType, error) {
+		query := `SELECT selectedline FROM screen WHERE screenid = ?`
+		sline := tx.GetInt(query, screenId)
+		query = `SELECT linenum FROM line WHERE screenid = ? AND linenum = ?`
+		if tx.Exists(query, screenId, sline) {
+			// selected line is valid
+			return nil, nil
+		}
+		query = `SELECT min(linenum) FROM line WHERE screenid = ? AND linenum > ?`
+		newSLine := tx.GetInt(query, screenId, sline)
+		if newSLine == 0 {
+			query = `SELECT max(linenum) FROM line WHERE screenid = ? AND linenum < ?`
+			newSLine = tx.GetInt(query, screenId, sline)
+		}
+		// newSLine might be 0, but that's ok (because that means there are no lines)
+		query = `UPDATE screen SET selectedline = ? WHERE screenid = ?`
+		tx.Exec(query, newSLine, screenId)
+		return GetScreenById(tx.Context(), screenId)
+	})
+}
+
+func DeleteLinesByIds(ctx context.Context, screenId string, lineIds []string) error {
 	txErr := WithTx(ctx, func(tx *TxWrap) error {
 		isWS := isWebShare(tx, screenId)
 		for _, lineId := range lineIds {
-			query := `DELETE FROM line WHERE screenid = ? AND lineid = ?`
-			tx.Exec(query, screenId, lineId)
-			query = `DELETE FROM history WHERE screenid = ? AND lineid = ?`
-			tx.Exec(query, screenId, lineId)
-			err := purgeCmdByScreenId(tx.Context(), screenId, lineId)
-			if err != nil {
-				return err
+			query := `SELECT status FROM cmd WHERE screenid = ? AND lineid = ?`
+			cmdStatus := tx.GetString(query, screenId, lineId)
+			if cmdStatus == CmdStatusRunning {
+				return fmt.Errorf("cannot delete line[%s], cmd is running", lineId)
 			}
+			query = `DELETE FROM line WHERE screenid = ? AND lineid = ?`
+			tx.Exec(query, screenId, lineId)
+			query = `DELETE FROM cmd WHERE screenid = ? AND lineid = ?`
+			tx.Exec(query, screenId, lineId)
+			// don't delete history anymore, just remove lineid reference
+			query = `UPDATE history SET lineid = '', linenum = 0 WHERE screenid = ? AND lineid = ?`
+			tx.Exec(query, screenId, lineId)
 			if isWS {
 				insertScreenLineUpdate(tx, screenId, lineId, UpdateType_LineDel)
 			}
@@ -2019,81 +2112,6 @@ func GetRIsForScreen(ctx context.Context, sessionId string, screenId string) ([]
 		return nil, txErr
 	}
 	return rtn, nil
-}
-
-func GetCurDayStr() string {
-	now := time.Now()
-	dayStr := now.Format("2006-01-02")
-	return dayStr
-}
-
-func UpdateCurrentActivity(ctx context.Context, update ActivityUpdate) error {
-	now := time.Now()
-	dayStr := GetCurDayStr()
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		var tdata TelemetryData
-		query := `SELECT tdata FROM activity WHERE day = ?`
-		found := tx.Get(&tdata, query, dayStr)
-		if !found {
-			query = `INSERT INTO activity (day, uploaded, tdata, tzname, tzoffset, clientversion, clientarch, buildtime, osrelease)
-                                   VALUES (?,   0,        ?,     ?,      ?,        ?,             ?         , ?        , ?)`
-			tzName, tzOffset := now.Zone()
-			if len(tzName) > MaxTzNameLen {
-				tzName = tzName[0:MaxTzNameLen]
-			}
-			tx.Exec(query, dayStr, tdata, tzName, tzOffset, scbase.WaveVersion, scbase.ClientArch(), scbase.BuildTime, scbase.MacOSRelease())
-		}
-		tdata.NumCommands += update.NumCommands
-		tdata.FgMinutes += update.FgMinutes
-		tdata.ActiveMinutes += update.ActiveMinutes
-		tdata.OpenMinutes += update.OpenMinutes
-		tdata.ClickShared += update.ClickShared
-		tdata.HistoryView += update.HistoryView
-		tdata.BookmarksView += update.BookmarksView
-		if update.NumConns > 0 {
-			tdata.NumConns = update.NumConns
-		}
-		query = `UPDATE activity
-                 SET tdata = ?,
-                     clientversion = ?,
-                     buildtime = ?
-                 WHERE day = ?`
-		tx.Exec(query, tdata, scbase.WaveVersion, scbase.BuildTime, dayStr)
-		return nil
-	})
-	if txErr != nil {
-		return txErr
-	}
-	return nil
-}
-
-func GetNonUploadedActivity(ctx context.Context) ([]*ActivityType, error) {
-	var rtn []*ActivityType
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT * FROM activity WHERE uploaded = 0 ORDER BY day DESC LIMIT 30`
-		tx.Select(&rtn, query)
-		return nil
-	})
-	if txErr != nil {
-		return nil, txErr
-	}
-	return rtn, nil
-}
-
-// note, will not mark the current day as uploaded
-func MarkActivityAsUploaded(ctx context.Context, activityArr []*ActivityType) error {
-	dayStr := GetCurDayStr()
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `UPDATE activity SET uploaded = 1 WHERE day = ?`
-		for _, activity := range activityArr {
-			if activity.Day == dayStr {
-				continue
-			}
-			tx.Exec(query, activity.Day)
-		}
-		return nil
-	})
-	return txErr
 }
 
 func foundInStrArr(strs []string, s string) bool {
@@ -2160,281 +2178,6 @@ func GetDBVersion(ctx context.Context) (int, error) {
 	return version, txErr
 }
 
-type bookmarkOrderType struct {
-	BookmarkId string
-	OrderIdx   int64
-}
-
-func GetBookmarks(ctx context.Context, tag string) ([]*BookmarkType, error) {
-	var bms []*BookmarkType
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		var query string
-		if tag == "" {
-			query = `SELECT * FROM bookmark`
-			bms = dbutil.SelectMapsGen[*BookmarkType](tx, query)
-		} else {
-			query = `SELECT * FROM bookmark WHERE EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)`
-			bms = dbutil.SelectMapsGen[*BookmarkType](tx, query, tag)
-		}
-		bmMap := dbutil.MakeGenMap(bms)
-		var orders []bookmarkOrderType
-		query = `SELECT bookmarkid, orderidx FROM bookmark_order WHERE tag = ?`
-		tx.Select(&orders, query, tag)
-		for _, bmOrder := range orders {
-			bm := bmMap[bmOrder.BookmarkId]
-			if bm != nil {
-				bm.OrderIdx = bmOrder.OrderIdx
-			}
-		}
-		return nil
-	})
-	if txErr != nil {
-		return nil, txErr
-	}
-	return bms, nil
-}
-
-func GetBookmarkById(ctx context.Context, bookmarkId string, tag string) (*BookmarkType, error) {
-	var rtn *BookmarkType
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT * FROM bookmark WHERE bookmarkid = ?`
-		rtn = dbutil.GetMapGen[*BookmarkType](tx, query, bookmarkId)
-		if rtn == nil {
-			return nil
-		}
-		query = `SELECT orderidx FROM bookmark_order WHERE bookmarkid = ? AND tag = ?`
-		orderIdx := tx.GetInt(query, bookmarkId, tag)
-		rtn.OrderIdx = int64(orderIdx)
-		return nil
-	})
-	if txErr != nil {
-		return nil, txErr
-	}
-	return rtn, nil
-}
-
-func GetBookmarkIdByArg(ctx context.Context, bookmarkArg string) (string, error) {
-	var rtnId string
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		if len(bookmarkArg) == 8 {
-			query := `SELECT bookmarkid FROM bookmark WHERE bookmarkid LIKE (? || '%')`
-			rtnId = tx.GetString(query, bookmarkArg)
-			return nil
-		}
-		query := `SELECT bookmarkid FROM bookmark WHERE bookmarkid = ?`
-		rtnId = tx.GetString(query, bookmarkArg)
-		return nil
-	})
-	if txErr != nil {
-		return "", txErr
-	}
-	return rtnId, nil
-}
-
-func GetBookmarkIdsByCmdStr(ctx context.Context, cmdStr string) ([]string, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) ([]string, error) {
-		query := `SELECT bookmarkid FROM bookmark WHERE cmdstr = ?`
-		bmIds := tx.SelectStrings(query, cmdStr)
-		return bmIds, nil
-	})
-}
-
-// ignores OrderIdx field
-func InsertBookmark(ctx context.Context, bm *BookmarkType) error {
-	if bm == nil || bm.BookmarkId == "" {
-		return fmt.Errorf("invalid empty bookmark id")
-	}
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT bookmarkid FROM bookmark WHERE bookmarkid = ?`
-		if tx.Exists(query, bm.BookmarkId) {
-			return fmt.Errorf("bookmarkid already exists")
-		}
-		query = `INSERT INTO bookmark ( bookmarkid, createdts, cmdstr, alias, tags, description)
-                               VALUES (:bookmarkid,:createdts,:cmdstr,:alias,:tags,:description)`
-		tx.NamedExec(query, bm.ToMap())
-		for _, tag := range append(bm.Tags, "") {
-			query = `SELECT COALESCE(max(orderidx), 0) FROM bookmark_order WHERE tag = ?`
-			maxOrder := tx.GetInt(query, tag)
-			query = `INSERT INTO bookmark_order (tag, bookmarkid, orderidx) VALUES (?, ?, ?)`
-			tx.Exec(query, tag, bm.BookmarkId, maxOrder+1)
-		}
-		return nil
-	})
-	return txErr
-}
-
-const (
-	BookmarkField_Desc   = "desc"
-	BookmarkField_CmdStr = "cmdstr"
-)
-
-func EditBookmark(ctx context.Context, bookmarkId string, editMap map[string]interface{}) error {
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT bookmarkid FROM bookmark WHERE bookmarkid = ?`
-		if !tx.Exists(query, bookmarkId) {
-			return fmt.Errorf("bookmark not found")
-		}
-		if desc, found := editMap[BookmarkField_Desc]; found {
-			query = `UPDATE bookmark SET description = ? WHERE bookmarkid = ?`
-			tx.Exec(query, desc, bookmarkId)
-		}
-		if cmdStr, found := editMap[BookmarkField_CmdStr]; found {
-			query = `UPDATE bookmark SET cmdstr = ? WHERE bookmarkid = ?`
-			tx.Exec(query, cmdStr, bookmarkId)
-		}
-		return nil
-	})
-	return txErr
-}
-
-func fixupBookmarkOrder(tx *TxWrap) {
-	query := `
-WITH new_order AS (
-  SELECT tag, bookmarkid, row_number() OVER (PARTITION BY tag ORDER BY orderidx) AS newidx FROM bookmark_order
-)
-UPDATE bookmark_order
-SET orderidx = new_order.newidx
-FROM new_order
-WHERE bookmark_order.tag = new_order.tag AND bookmark_order.bookmarkid = new_order.bookmarkid
-`
-	tx.Exec(query)
-}
-
-func DeleteBookmark(ctx context.Context, bookmarkId string) error {
-	txErr := WithTx(ctx, func(tx *TxWrap) error {
-		query := `SELECT bookmarkid FROM bookmark WHERE bookmarkid = ?`
-		if !tx.Exists(query, bookmarkId) {
-			return fmt.Errorf("bookmark not found")
-		}
-		query = `DELETE FROM bookmark WHERE bookmarkid = ?`
-		tx.Exec(query, bookmarkId)
-		query = `DELETE FROM bookmark_order WHERE bookmarkid = ?`
-		tx.Exec(query, bookmarkId)
-		fixupBookmarkOrder(tx)
-		return nil
-	})
-	return txErr
-}
-
-func CreatePlaybook(ctx context.Context, name string) (*PlaybookType, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) (*PlaybookType, error) {
-		query := `SELECT playbookid FROM playbook WHERE name = ?`
-		if tx.Exists(query, name) {
-			return nil, fmt.Errorf("playbook %q already exists", name)
-		}
-		rtn := &PlaybookType{}
-		rtn.PlaybookId = uuid.New().String()
-		rtn.PlaybookName = name
-		query = `INSERT INTO playbook ( playbookid, playbookname, description, entryids)
-                               VALUES (:playbookid,:playbookname,:description,:entryids)`
-		tx.Exec(query, rtn.ToMap())
-		return rtn, nil
-	})
-}
-
-func selectPlaybook(tx *TxWrap, playbookId string) *PlaybookType {
-	query := `SELECT * FROM playbook where playbookid = ?`
-	playbook := dbutil.GetMapGen[*PlaybookType](tx, query, playbookId)
-	return playbook
-}
-
-func AddPlaybookEntry(ctx context.Context, entry *PlaybookEntry) error {
-	if entry.EntryId == "" {
-		return fmt.Errorf("invalid entryid")
-	}
-	return WithTx(ctx, func(tx *TxWrap) error {
-		playbook := selectPlaybook(tx, entry.PlaybookId)
-		if playbook == nil {
-			return fmt.Errorf("cannot add entry, playbook does not exist")
-		}
-		query := `SELECT entryid FROM playbook_entry WHERE entryid = ?`
-		if tx.Exists(query, entry.EntryId) {
-			return fmt.Errorf("cannot add entry, entryid already exists")
-		}
-		query = `INSERT INTO playbook_entry ( entryid, playbookid, description, alias, cmdstr, createdts, updatedts)
-                                     VALUES (:entryid,:playbookid,:description,:alias,:cmdstr,:createdts,:updatedts)`
-		tx.Exec(query, entry)
-		playbook.EntryIds = append(playbook.EntryIds, entry.EntryId)
-		query = `UPDATE playbook SET entryids = ? WHERE playbookid = ?`
-		tx.Exec(query, quickJsonArr(playbook.EntryIds), entry.PlaybookId)
-		return nil
-	})
-}
-
-func RemovePlaybookEntry(ctx context.Context, playbookId string, entryId string) error {
-	return WithTx(ctx, func(tx *TxWrap) error {
-		playbook := selectPlaybook(tx, playbookId)
-		if playbook == nil {
-			return fmt.Errorf("cannot remove playbook entry, playbook does not exist")
-		}
-		query := `SELECT entryid FROM playbook_entry WHERE entryid = ?`
-		if !tx.Exists(query, entryId) {
-			return fmt.Errorf("cannot remove playbook entry, entry does not exist")
-		}
-		query = `DELETE FROM playbook_entry WHERE entryid = ?`
-		tx.Exec(query, entryId)
-		playbook.RemoveEntry(entryId)
-		query = `UPDATE playbook SET entryids = ? WHERE playbookid = ?`
-		tx.Exec(query, quickJsonArr(playbook.EntryIds), playbookId)
-		return nil
-	})
-}
-
-func GetPlaybookById(ctx context.Context, playbookId string) (*PlaybookType, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) (*PlaybookType, error) {
-		rtn := selectPlaybook(tx, playbookId)
-		if rtn == nil {
-			return nil, nil
-		}
-		query := `SELECT * FROM playbook_entry WHERE playbookid = ?`
-		tx.Select(&rtn.Entries, query, playbookId)
-		rtn.OrderEntries()
-		return rtn, nil
-	})
-}
-
-func getLineIdsFromHistoryItems(historyItems []*HistoryItemType) []string {
-	var rtn []string
-	for _, hitem := range historyItems {
-		if hitem.LineId != "" {
-			rtn = append(rtn, hitem.LineId)
-		}
-	}
-	return rtn
-}
-
-func GetLineCmdsFromHistoryItems(ctx context.Context, historyItems []*HistoryItemType) ([]*LineType, []*CmdType, error) {
-	if len(historyItems) == 0 {
-		return nil, nil, nil
-	}
-	return WithTxRtn3(ctx, func(tx *TxWrap) ([]*LineType, []*CmdType, error) {
-		lineIdsJsonArr := quickJsonArr(getLineIdsFromHistoryItems(historyItems))
-		query := `SELECT * FROM line WHERE lineid IN (SELECT value FROM json_each(?))`
-		lineArr := dbutil.SelectMappable[*LineType](tx, query, lineIdsJsonArr)
-		query = `SELECT * FROM cmd WHERE lineid IN (SELECT value FROM json_each(?))`
-		cmdArr := dbutil.SelectMapsGen[*CmdType](tx, query, lineIdsJsonArr)
-		return lineArr, cmdArr, nil
-	})
-}
-
-func PurgeHistoryByIds(ctx context.Context, historyIds []string) ([]*HistoryItemType, error) {
-	return WithTxRtn(ctx, func(tx *TxWrap) ([]*HistoryItemType, error) {
-		query := `SELECT * FROM history WHERE historyid IN (SELECT value FROM json_each(?))`
-		rtn := dbutil.SelectMapsGen[*HistoryItemType](tx, query, quickJsonArr(historyIds))
-		query = `DELETE FROM history WHERE historyid IN (SELECT value FROM json_each(?))`
-		tx.Exec(query, quickJsonArr(historyIds))
-		for _, hitem := range rtn {
-			if hitem.LineId != "" {
-				err := PurgeLinesByIds(tx.Context(), hitem.ScreenId, []string{hitem.LineId})
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-		return rtn, nil
-	})
-}
-
 func CountScreenWebShares(ctx context.Context) (int, error) {
 	return WithTxRtn(ctx, func(tx *TxWrap) (int, error) {
 		query := `SELECT count(*) FROM screen WHERE sharemode = ?`
@@ -2451,37 +2194,38 @@ func CountScreenLines(ctx context.Context, screenId string) (int, error) {
 	})
 }
 
-func CanScreenWebShare(ctx context.Context, screen *ScreenType) error {
-	if screen == nil {
-		return fmt.Errorf("cannot share screen, not found")
-	}
-	if screen.ShareMode == ShareModeWeb {
-		return fmt.Errorf("screen is already shared to web")
-	}
-	if screen.ShareMode != ShareModeLocal {
-		return fmt.Errorf("screen cannot be shared, invalid current share mode %q (must be local)", screen.ShareMode)
-	}
-	if screen.Archived {
-		return fmt.Errorf("screen cannot be shared, must un-archive before sharing")
-	}
-	webShareCount, err := CountScreenWebShares(ctx)
-	if err != nil {
-		return fmt.Errorf("screen cannot be share: error getting webshare count: %v", err)
-	}
-	if webShareCount >= MaxWebShareScreenCount {
-		go UpdateCurrentActivity(context.Background(), ActivityUpdate{WebShareLimit: 1})
-		return fmt.Errorf("screen cannot be shared, limited to a maximum of %d shared screen(s)", MaxWebShareScreenCount)
-	}
-	lineCount, err := CountScreenLines(ctx, screen.ScreenId)
-	if err != nil {
-		return fmt.Errorf("screen cannot be share: error getting screen line count: %v", err)
-	}
-	if lineCount > MaxWebShareLineCount {
-		go UpdateCurrentActivity(context.Background(), ActivityUpdate{WebShareLimit: 1})
-		return fmt.Errorf("screen cannot be shared, limited to a maximum of %d lines", MaxWebShareLineCount)
-	}
-	return nil
-}
+// Below is currently not used and is causing circular dependency due to moving telemetry code to a new package. It will likely be rewritten whenever we add back webshare and should be moved to a different package then.
+// func CanScreenWebShare(ctx context.Context, screen *ScreenType) error {
+// 	if screen == nil {
+// 		return fmt.Errorf("cannot share screen, not found")
+// 	}
+// 	if screen.ShareMode == ShareModeWeb {
+// 		return fmt.Errorf("screen is already shared to web")
+// 	}
+// 	if screen.ShareMode != ShareModeLocal {
+// 		return fmt.Errorf("screen cannot be shared, invalid current share mode %q (must be local)", screen.ShareMode)
+// 	}
+// 	if screen.Archived {
+// 		return fmt.Errorf("screen cannot be shared, must un-archive before sharing")
+// 	}
+// 	webShareCount, err := CountScreenWebShares(ctx)
+// 	if err != nil {
+// 		return fmt.Errorf("screen cannot be share: error getting webshare count: %v", err)
+// 	}
+// 	if webShareCount >= MaxWebShareScreenCount {
+// 		go UpdateCurrentActivity(context.Background(), ActivityUpdate{WebShareLimit: 1})
+// 		return fmt.Errorf("screen cannot be shared, limited to a maximum of %d shared screen(s)", MaxWebShareScreenCount)
+// 	}
+// 	lineCount, err := CountScreenLines(ctx, screen.ScreenId)
+// 	if err != nil {
+// 		return fmt.Errorf("screen cannot be share: error getting screen line count: %v", err)
+// 	}
+// 	if lineCount > MaxWebShareLineCount {
+// 		go UpdateCurrentActivity(context.Background(), ActivityUpdate{WebShareLimit: 1})
+// 		return fmt.Errorf("screen cannot be shared, limited to a maximum of %d lines", MaxWebShareLineCount)
+// 	}
+// 	return nil
+// }
 
 func ScreenWebShareStart(ctx context.Context, screenId string, shareOpts ScreenWebShareOpts) error {
 	return WithTx(ctx, func(tx *TxWrap) error {
@@ -2654,5 +2398,20 @@ func SetWebPtyPos(ctx context.Context, screenId string, lineId string, ptyPos in
 			tx.Exec(query, screenId, lineId, ptyPos)
 		}
 		return nil
+	})
+}
+
+func GetRemoteActiveShells(ctx context.Context, remoteId string) ([]string, error) {
+	return WithTxRtn(ctx, func(tx *TxWrap) ([]string, error) {
+		query := `SELECT * FROM remote_instance WHERE remoteid = ?`
+		riArr := dbutil.SelectMapsGen[*RemoteInstance](tx, query, remoteId)
+		shellTypeMap := make(map[string]bool)
+		for _, ri := range riArr {
+			if ri.ShellType == "" {
+				continue
+			}
+			shellTypeMap[ri.ShellType] = true
+		}
+		return utilfn.GetMapKeys(shellTypeMap), nil
 	})
 }

@@ -8,149 +8,395 @@ import { sprintf } from "sprintf-js";
 import { boundMethod } from "autobind-decorator";
 import dayjs from "dayjs";
 import localizedFormat from "dayjs/plugin/localizedFormat";
-import { If } from "tsx-control-statements/components";
-import { GlobalModel, GlobalCommandRunner, Cmd, getTermPtyData } from "../../model/model";
-import { termHeightFromRows } from "../../util/textmeasure";
-import type {
-    LineType,
-    RemoteType,
-    RemotePtrType,
-    RenderModeType,
-    RendererOpts,
-    RendererPluginType,
-    LineHeightChangeCallbackType,
-    RendererModelInitializeParams,
-    RendererModel,
-} from "../../types/types";
-import cn from "classnames";
+import { Choose, If, Otherwise, When } from "tsx-control-statements/components";
+import { GlobalModel, GlobalCommandRunner, Cmd } from "@/models";
+import { termHeightFromRows } from "@/util/textmeasure";
+import { clsx } from "clsx";
+import { getTermPtyData } from "@/util/modelutil";
 
-import { ReactComponent as FavoritesIcon } from "../assets/icons/favourites.svg";
-import { ReactComponent as PinIcon } from "../assets/icons/pin.svg";
-import { ReactComponent as PlusIcon } from "../assets/icons/plus.svg";
-import { ReactComponent as MinusIcon } from "../assets/icons/minus.svg";
-
-import type { LineContainerModel } from "../../model/model";
-import { renderCmdText } from "../common/common";
-import { SimpleBlobRenderer } from "../../plugins/core/basicrenderer";
-import { IncrementalRenderer } from "../../plugins/core/incrementalrenderer";
-import { TerminalRenderer } from "../../plugins/terminal/terminal";
-import { isBlank } from "../../util/util";
-import { PluginModel } from "../../plugins/plugins";
-import { Prompt } from "../common/prompt/prompt";
+import { renderCmdText } from "@/common/elements";
+import { SimpleBlobRenderer } from "@/plugins/core/basicrenderer";
+import { IncrementalRenderer } from "@/plugins/core/incrementalrenderer";
+import { TerminalRenderer } from "@/plugins/terminal/terminal";
+import { isBlank } from "@/util/util";
+import { PluginModel } from "@/plugins/plugins";
+import { Prompt } from "@/common/prompt/prompt";
 import * as lineutil from "./lineutil";
-import { ErrorBoundary } from "../../app/common/error/errorboundary";
-import * as constants from "../appconst";
+import { ErrorBoundary } from "@/common/error/errorboundary";
+import * as appconst from "@/app/appconst";
+import * as util from "@/util/util";
 
-import { ReactComponent as CheckIcon } from "../assets/icons/line/check.svg";
-import { ReactComponent as CommentIcon } from "../assets/icons/line/comment.svg";
-import { ReactComponent as QuestionIcon } from "../assets/icons/line/question.svg";
-import { ReactComponent as RotateIcon } from "../assets/icons/line/rotate.svg";
-import { ReactComponent as WarningIcon } from "../assets/icons/line/triangle-exclamation.svg";
-import { ReactComponent as XmarkIcon } from "../assets/icons/line/xmark.svg";
-import { ReactComponent as FillIcon } from "../assets/icons/line/fill.svg";
-import { ReactComponent as GearIcon } from "../assets/icons/line/gear.svg";
+import "./line.less";
+import { RotateIcon } from "../common/icons/icons";
 
-import "./lines.less";
+const DebugHeightProblems = false;
+const MinLine = 0;
+const MaxLine = 1000;
+const heightLog = {};
+(window as any).heightLog = heightLog;
+(window as any).findHeightProblems = function () {
+    for (const linenum in heightLog) {
+        const lh = heightLog[linenum];
+        if (lh.heightArr == null || lh.heightArr.length < 2) {
+            continue;
+        }
+        const firstHeight = lh.heightArr[0];
+        for (let i = 1; i < lh.heightArr.length; i++) {
+            if (lh.heightArr[i] != firstHeight) {
+                console.log("line", linenum, "heights", lh.heightArr);
+                break;
+            }
+        }
+    }
+};
 
 dayjs.extend(localizedFormat);
 
-type OV<V> = mobx.IObservableValue<V>;
+function cmdShouldMarkError(cmd: Cmd): boolean {
+    if (cmd.getStatus() == "error") {
+        return true;
+    }
+    const exitCode = cmd.getExitCode();
+    // 0, SIGINT, or SIGPIPE
+    if (exitCode == 0 || exitCode == 130 || exitCode == 141) {
+        return false;
+    }
+    return true;
+}
+
+function getIsHidePrompt(line: LineType): boolean {
+    let rendererPlugin: RendererPluginType = null;
+    const isNoneRenderer = line.renderer == "none";
+    if (!isBlank(line.renderer) && line.renderer != "terminal" && !isNoneRenderer) {
+        rendererPlugin = PluginModel.getRendererPluginByName(line.renderer);
+    }
+    const hidePrompt = rendererPlugin?.hidePrompt;
+    return hidePrompt;
+}
 
 @mobxReact.observer
-class SmallLineAvatar extends React.Component<{ line: LineType; cmd: Cmd; onRightClick?: (e: any) => void }, {}> {
-    render() {
-        let { line, cmd } = this.props;
-        let lineNumStr = (line.linenumtemp ? "~" : "#") + String(line.linenum);
-        let status = cmd != null ? cmd.getStatus() : "done";
-        let rtnstate = cmd != null ? cmd.getRtnState() : false;
-        let exitcode = cmd != null ? cmd.getExitCode() : 0;
-        let isComment = line.linetype == "text";
-        let icon = null;
-        let iconTitle = null;
-        if (isComment) {
-            icon = <CommentIcon />;
-            iconTitle = "comment";
-        } else if (status == "done") {
-            if (exitcode === 0) {
-                icon = <CheckIcon className="success" />;
-                iconTitle = "success";
-            } else {
-                icon = <XmarkIcon className="fail" />;
-                iconTitle = "fail";
-            }
-        } else if (status == "hangup" || status == "error") {
-            icon = <WarningIcon className="warning" />;
-            iconTitle = status;
-        } else if (status == "running" || "detached") {
-            icon = <RotateIcon className="warning spin" />;
-            iconTitle = "running";
+class LineActions extends React.Component<{ screen: LineContainerType; line: LineType; cmd: Cmd }, {}> {
+    @boundMethod
+    clickStar() {
+        const { line } = this.props;
+        if (!line.star || line.star == 0) {
+            GlobalCommandRunner.lineStar(line.lineid, 1);
         } else {
-            icon = <QuestionIcon />;
-            iconTitle = "unknown";
+            GlobalCommandRunner.lineStar(line.lineid, 0);
         }
+    }
+
+    @boundMethod
+    clickPin() {
+        const { line } = this.props;
+        if (!line.pinned) {
+            GlobalCommandRunner.linePin(line.lineid, true);
+        } else {
+            GlobalCommandRunner.linePin(line.lineid, false);
+        }
+    }
+
+    @boundMethod
+    clickBookmark() {
+        const { line } = this.props;
+        GlobalCommandRunner.lineBookmark(line.lineid);
+    }
+
+    @boundMethod
+    clickDelete() {
+        const { line } = this.props;
+        GlobalCommandRunner.lineDelete(line.lineid, true);
+    }
+
+    @boundMethod
+    clickRestart() {
+        const { line } = this.props;
+        GlobalCommandRunner.lineRestart(line.lineid, true);
+    }
+
+    @boundMethod
+    clickChat(e: any) {
+        e.stopPropagation();
+        const { line, screen } = this.props;
+        const termWrap = screen.getTermWrap(line.lineid);
+        const cmd = screen.getCmd(line);
+        if (termWrap && cmd) {
+            GlobalModel.sidebarchatModel.setCmdAndOutput(
+                screen.getCmd(line)?.getCmdStr(),
+                termWrap?.getOutput(false),
+                // multiply by 2 to get a rough estimate of the number of rows within the chatbox
+                screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, 300) * 2,
+                cmdShouldMarkError(cmd)
+            );
+            GlobalModel.inputModel.setChatSidebarFocus();
+            GlobalModel.sidebarchatModel.resetSelectedCodeBlockIndex();
+        }
+    }
+
+    @boundMethod
+    clickMinimize() {
+        const { line } = this.props;
+        const isMinimized = line.linestate["wave:min"];
+        GlobalCommandRunner.lineMinimize(line.lineid, !isMinimized, true);
+    }
+
+    @boundMethod
+    clickMoveToSidebar() {
+        const { line } = this.props;
+        GlobalCommandRunner.screenSidebarAddLine(line.lineid);
+    }
+
+    @boundMethod
+    clickRemoveFromSidebar() {
+        GlobalCommandRunner.screenSidebarRemove();
+    }
+
+    @boundMethod
+    handleResizeButton() {
+        console.log("resize button");
+    }
+
+    @boundMethod
+    handleLineSettings(e: any): void {
+        e.preventDefault();
+        e.stopPropagation();
+        const { line } = this.props;
+        if (line != null) {
+            mobx.action(() => {
+                GlobalModel.lineSettingsModal.set(line.linenum);
+            })();
+            GlobalModel.modalsModel.pushModal(appconst.LINE_SETTINGS);
+        }
+    }
+
+    render() {
+        const { line, screen } = this.props;
+        const isMinimized = line.linestate["wave:min"];
+        const containerType = screen.getContainerType();
+        // console.log("******************", screen.getTermWrap(line.lineid));
         return (
-            <div
-                onContextMenu={this.props.onRightClick}
-                title={iconTitle}
-                className={cn("simple-line-status", "status-" + status, rtnstate ? "has-rtnstate" : null)}
-            >
-                <span className="linenum">{lineNumStr}</span>
-                <div className="avatar">{icon}</div>
+            <div className="line-actions">
+                <Choose>
+                    <When condition={containerType == appconst.LineContainer_Main}>
+                        <div key="chat" title="Ask Wave AI" className="line-icon" onClick={this.clickChat}>
+                            <i className="fa-sharp fa-regular fa-sparkles fa-fw" />
+                        </div>
+                        <div key="restart" title="Restart Command" className="line-icon" onClick={this.clickRestart}>
+                            <i className="fa-sharp fa-regular fa-arrows-rotate fa-fw" />
+                        </div>
+                        <div
+                            key="delete"
+                            title="Delete Line (&#x2318;D)"
+                            className="line-icon"
+                            onClick={this.clickDelete}
+                        >
+                            <i className="fa-sharp fa-regular fa-trash fa-fw" />
+                        </div>
+                        <div
+                            key="bookmark"
+                            title="Bookmark"
+                            className={clsx("line-icon", "line-bookmark")}
+                            onClick={this.clickBookmark}
+                        >
+                            <i className="fa-sharp fa-regular fa-bookmark fa-fw" />
+                        </div>
+                        <div
+                            key="minimize"
+                            title={`${isMinimized ? "Show Output" : "Hide Output"}`}
+                            className={clsx("line-icon", isMinimized ? "active" : "")}
+                            onClick={this.clickMinimize}
+                        >
+                            <Choose>
+                                <When condition={isMinimized}>
+                                    <i className="fa-sharp fa-regular fa-circle-plus fa-fw" />
+                                </When>
+                                <Otherwise>
+                                    <i className="fa-sharp fa-regular fa-circle-minus fa-fw" />
+                                </Otherwise>
+                            </Choose>
+                        </div>
+                        <div
+                            className="line-icon line-sidebar"
+                            onClick={this.clickMoveToSidebar}
+                            title="Move to Sidebar"
+                        >
+                            <i className="fa-sharp fa-solid fa-right-to-line fa-fw" />
+                        </div>
+                        <div
+                            key="settings"
+                            title="Line Settings"
+                            className="line-icon line-icon-shrink-left"
+                            onClick={this.handleLineSettings}
+                        >
+                            <i className="fa-sharp fa-regular fa-ellipsis-vertical fa-fw" />
+                        </div>
+                    </When>
+                    <When condition={containerType == appconst.LineContainer_Sidebar}>
+                        <div
+                            key="delete"
+                            title="Delete Line (&#x2318;D)"
+                            className="line-icon"
+                            onClick={this.clickDelete}
+                        >
+                            <i className="fa-sharp fa-regular fa-trash fa-fw" />
+                        </div>
+                        <div
+                            key="bookmark"
+                            title="Bookmark"
+                            className={clsx("line-icon", "line-bookmark")}
+                            onClick={this.clickBookmark}
+                        >
+                            <i className="fa-sharp fa-regular fa-bookmark fa-fw" />
+                        </div>
+                        <div
+                            className="line-icon line-sidebar"
+                            onClick={this.clickRemoveFromSidebar}
+                            title="Move to Sidebar"
+                        >
+                            <i className="fa-sharp fa-solid fa-left-to-line fa-fw" />
+                        </div>
+                    </When>
+                </Choose>
             </div>
         );
     }
 }
 
 @mobxReact.observer
-class LineCmd extends React.Component<
-    {
-        screen: LineContainerModel;
-        line: LineType;
-        width: number;
-        staticRender: boolean;
-        visible: OV<boolean>;
-        onHeightChange: LineHeightChangeCallbackType;
-        renderMode: RenderModeType;
-        overrideCollapsed: OV<boolean>;
-        noSelect?: boolean;
-        showHints?: boolean;
-    },
-    {}
-> {
-    lineRef: React.RefObject<any> = React.createRef();
-    cmdTextRef: React.RefObject<any> = React.createRef();
+class LineHeader extends React.Component<{ screen: LineContainerType; line: LineType; cmd: Cmd }, {}> {
+    renderCmdText(cmd: Cmd): any {
+        if (cmd == null) {
+            return (
+                <div className="metapart-mono cmdtext">
+                    <span className="term-bright-green">(cmd not found)</span>
+                </div>
+            );
+        }
+        const isMultiLine = lineutil.isMultiLineCmdText(cmd.getCmdStr());
+        return (
+            <React.Fragment>
+                <div
+                    key="meta2"
+                    className={clsx(
+                        "meta meta-line2 cmdtext-expanded no-highlight-scrollbar scrollbar-hide-until-hover",
+                        {
+                            "is-multiline": isMultiLine,
+                        }
+                    )}
+                >
+                    {lineutil.getFullCmdText(cmd.getCmdStr())}
+                </div>
+            </React.Fragment>
+        );
+    }
+
+    renderMeta1(cmd: Cmd) {
+        const { line } = this.props;
+        let formattedTime: string = "";
+        const restartTs = cmd.getRestartTs();
+        let timeTitle: string = null;
+        if (restartTs != null && restartTs > 0) {
+            formattedTime = "restarted @ " + lineutil.getLineDateTimeStr(restartTs);
+            timeTitle = "original start time " + lineutil.getLineDateTimeStr(line.ts);
+        } else {
+            formattedTime = lineutil.getLineDateTimeStr(line.ts);
+        }
+        const renderer = line.renderer;
+        const durationMs = cmd.getDurationMs();
+        return (
+            <div key="meta1" className="meta meta-line1">
+                <SmallLineAvatar line={line} cmd={cmd} />
+                <div className="meta-divider">|</div>
+                <Prompt rptr={cmd.remote} festate={cmd.getRemoteFeState()} color={false} />
+                <div className="meta-divider">|</div>
+                <div title={timeTitle} className="ts">
+                    {formattedTime} <If condition={durationMs > 0}>({util.formatDuration(durationMs)})</If>
+                </div>
+                <If condition={!isBlank(renderer) && renderer != "terminal"}>
+                    <div className="meta-divider">|</div>
+                    <div className="renderer">
+                        <i className="fa-sharp fa-solid fa-fill renderer-icon" />
+                        {renderer}
+                    </div>
+                </If>
+            </div>
+        );
+    }
+
+    render() {
+        const { line, cmd } = this.props;
+        const hidePrompt = getIsHidePrompt(line);
+        return (
+            <div key="header" className={clsx("line-header", { "hide-prompt": hidePrompt })}>
+                {this.renderMeta1(cmd)}
+                <If condition={!hidePrompt}>{this.renderCmdText(cmd)}</If>
+            </div>
+        );
+    }
+}
+
+@mobxReact.observer
+class SmallLineAvatar extends React.Component<{ line: LineType; cmd: Cmd; onRightClick?: (e: any) => void }, {}> {
+    render() {
+        const { line, cmd } = this.props;
+        const lineNumStr = (line.linenumtemp ? "~" : "#") + String(line.linenum);
+        const status = cmd != null ? cmd.getStatus() : "done";
+        const exitcode = cmd != null ? cmd.getExitCode() : 0;
+        const isComment = line.linetype == "text";
+        let icon = null;
+        let iconTitle = null;
+        if (isComment) {
+            icon = <i className="fa-sharp fa-solid fa-comment" />;
+            iconTitle = "comment";
+        } else if (status == "done") {
+            if (exitcode === 0) {
+                icon = <i className="success fa-sharp fa-solid fa-check" />;
+                iconTitle = "success";
+            } else {
+                icon = <i className="fail fa-sharp fa-solid fa-xmark" />;
+                iconTitle = "exitcode " + exitcode;
+            }
+        } else if (status == "hangup") {
+            icon = <i className="warning fa-sharp fa-solid fa-triangle-exclamation" />;
+            iconTitle = status;
+        } else if (status == "error") {
+            icon = <i className="fail fa-sharp fa-solid fa-xmark" />;
+            iconTitle = "error";
+        } else if (status == "running" || status == "detached") {
+            icon = <RotateIcon className="warning spin rotate" />;
+            iconTitle = "running";
+        } else {
+            icon = <i className="fail fa-sharp fa-solid fa-question" />;
+            iconTitle = "unknown";
+        }
+        return (
+            <>
+                <div className="linenum">{lineNumStr}</div>
+                <div title={iconTitle} className={clsx("status-icon", "status-" + status)}>
+                    {icon}
+                </div>
+            </>
+        );
+    }
+}
+
+@mobxReact.observer
+class RtnState extends React.Component<{ cmd: Cmd; line: LineType }> {
     rtnStateDiff: mobx.IObservableValue<string> = mobx.observable.box(null, {
         name: "linecmd-rtn-state-diff",
     });
     rtnStateDiffFetched: boolean = false;
-    lastHeight: number;
-    isOverflow: OV<boolean> = mobx.observable.box(false, {
-        name: "line-overflow",
-    });
-    isMinimised: OV<boolean> = mobx.observable.box(false, {
-        name: "line-minimised",
-    });
-    isCmdExpanded: OV<boolean> = mobx.observable.box(false, {
-        name: "cmd-expanded",
-    });
 
-    constructor(props) {
-        super(props);
+    componentDidMount() {
+        this.componentDidUpdate();
+    }
+
+    componentDidUpdate() {
+        this.checkStateDiffLoad();
     }
 
     checkStateDiffLoad(): void {
-        let { screen, line, staticRender, visible } = this.props;
-        if (staticRender) {
-            return;
-        }
-        if (!visible.get()) {
-            if (this.rtnStateDiffFetched) {
-                this.rtnStateDiffFetched = false;
-                this.setRtnStateDiff(null);
-            }
-            return;
-        }
-        let cmd = screen.getCmd(line);
+        const cmd = this.props.cmd;
         if (cmd == null || !cmd.getRtnState() || this.rtnStateDiffFetched) {
             return;
         }
@@ -164,15 +410,15 @@ class LineCmd extends React.Component<
         if (this.rtnStateDiffFetched) {
             return;
         }
-        let { line } = this.props;
+        const { line } = this.props;
         this.rtnStateDiffFetched = true;
-        let usp = new URLSearchParams({
+        const usp = new URLSearchParams({
             linenum: String(line.linenum),
             screenid: line.screenid,
             lineid: line.lineid,
         });
-        let url = GlobalModel.getBaseHostPort() + "/api/rtnstate?" + usp.toString();
-        let fetchHeaders = GlobalModel.getFetchHeaders();
+        const url = GlobalModel.getBaseHostPort() + "/api/rtnstate?" + usp.toString();
+        const fetchHeaders = GlobalModel.getFetchHeaders();
         fetch(url, { headers: fetchHeaders })
             .then((resp) => {
                 if (!resp.ok) {
@@ -196,60 +442,68 @@ class LineCmd extends React.Component<
         })();
     }
 
-    componentDidMount() {
-        this.componentDidUpdate(null, null, null);
-        this.checkCmdText();
-    }
-
-    @boundMethod
-    handleExpandCmd(): void {
-        mobx.action(() => {
-            this.isCmdExpanded.set(true);
-        })();
-    }
-
-    renderCmdText(cmd: Cmd): any {
-        if (cmd == null) {
-            return (
-                <div className="metapart-mono cmdtext">
-                    <span className="term-bright-green">(cmd not found)</span>
-                </div>
-            );
+    render() {
+        const { cmd } = this.props;
+        const rsdiff = this.rtnStateDiff.get();
+        const termFontSize = GlobalModel.getTermFontSize();
+        let rtnStateDiffSize = termFontSize - 2;
+        if (rtnStateDiffSize < 10) {
+            rtnStateDiffSize = Math.max(termFontSize, 10);
         }
-        if (this.isCmdExpanded.get()) {
-            return (
-                <React.Fragment>
-                    <div key="meta2" className="meta meta-line2">
-                        <div className="metapart-mono cmdtext">
-                            <Prompt rptr={cmd.remote} festate={cmd.getRemoteFeState()} />
-                        </div>
-                    </div>
-                    <div key="meta3" className="meta meta-line3 cmdtext-expanded-wrapper">
-                        <div className="cmdtext-expanded">{lineutil.getFullCmdText(cmd.getCmdStr())}</div>
-                    </div>
-                </React.Fragment>
-            );
-        }
-        let isMultiLine = lineutil.isMultiLineCmdText(cmd.getCmdStr());
         return (
-            <div key="meta2" className="meta meta-line2" ref={this.cmdTextRef}>
-                <div className="metapart-mono cmdtext">
-                    <Prompt rptr={cmd.remote} festate={cmd.getRemoteFeState()} />
-                    <span> </span>
-                    <span>{lineutil.getSingleLineCmdText(cmd.getCmdStr())}</span>
-                </div>
-                <If condition={this.isOverflow.get() || isMultiLine}>
-                    <div className="cmdtext-overflow" onClick={this.handleExpandCmd}>
-                        ...&#x25BC;
+            <div
+                key="rtnstate"
+                className="cmd-rtnstate"
+                style={{
+                    visibility: cmd.getStatus() == "done" ? "visible" : "hidden",
+                }}
+            >
+                <If condition={rsdiff == null || rsdiff == ""}>
+                    <div className="cmd-rtnstate-label">state unchanged</div>
+                    <div className="cmd-rtnstate-sep"></div>
+                </If>
+                <If condition={rsdiff != null && rsdiff != ""}>
+                    <div className="cmd-rtnstate-label">new state</div>
+                    <div className="cmd-rtnstate-sep"></div>
+                    <div className="cmd-rtnstate-diff" style={{ fontSize: rtnStateDiffSize }}>
+                        <div className="cmd-rtnstate-diff-inner">{this.rtnStateDiff.get()}</div>
                     </div>
                 </If>
             </div>
         );
     }
+}
+
+@mobxReact.observer
+class LineCmd extends React.Component<
+    {
+        screen: LineContainerType;
+        line: LineType;
+        width: number;
+        staticRender: boolean;
+        visible: OV<boolean>;
+        onHeightChange: LineHeightChangeCallbackType;
+        renderMode: RenderModeType;
+        overrideCollapsed: OV<boolean>;
+        noSelect?: boolean;
+        showHints?: boolean;
+    },
+    {}
+> {
+    lineRef: React.RefObject<any> = React.createRef();
+    lastHeight: number;
+
+    constructor(props) {
+        super(props);
+    }
+
+    componentDidMount() {
+        this.componentDidUpdate(null, null, null);
+    }
 
     // TODO: this might not be necessary anymore because we're using this.lastHeight
     getSnapshotBeforeUpdate(prevProps, prevState): { height: number } {
-        let elem = this.lineRef.current;
+        const elem = this.lineRef.current;
         if (elem == null) {
             return { height: 0 };
         }
@@ -258,35 +512,6 @@ class LineCmd extends React.Component<
 
     componentDidUpdate(prevProps, prevState, snapshot: { height: number }): void {
         this.handleHeightChange();
-        this.checkStateDiffLoad();
-        this.checkCmdText();
-    }
-
-    checkCmdText() {
-        let metaElem = this.cmdTextRef.current;
-        if (metaElem == null || metaElem.childNodes.length == 0) {
-            return;
-        }
-        let metaElemWidth = metaElem.offsetWidth;
-        if (metaElemWidth == 0) {
-            return;
-        }
-        let metaChild = metaElem.firstChild;
-        if (metaChild == null) {
-            return;
-        }
-        let children = metaChild.childNodes;
-        let childWidth = 0;
-        for (let i = 0; i < children.length; i++) {
-            let ch = children[i];
-            childWidth += ch.offsetWidth;
-        }
-        let isOverflow = childWidth > metaElemWidth;
-        if (isOverflow && isOverflow != this.isOverflow.get()) {
-            mobx.action(() => {
-                this.isOverflow.set(isOverflow);
-            })();
-        }
     }
 
     @boundMethod
@@ -294,30 +519,35 @@ class LineCmd extends React.Component<
         if (this.props.onHeightChange == null) {
             return;
         }
-        let { line } = this.props;
+        const { line } = this.props;
         let curHeight = 0;
-        let elem = this.lineRef.current;
+        const elem = this.lineRef.current;
         if (elem != null) {
             curHeight = elem.offsetHeight;
+        }
+        const linenum = line.linenum;
+        if (DebugHeightProblems && linenum >= MinLine && linenum <= MaxLine) {
+            heightLog[linenum] = heightLog[linenum] || {};
+            heightLog[linenum].heightArr = heightLog[linenum].heightArr || [];
+            heightLog[linenum].heightArr.push(curHeight);
         }
         if (this.lastHeight == curHeight) {
             return;
         }
-        let lastHeight = this.lastHeight;
+        const lastHeight = this.lastHeight;
         this.lastHeight = curHeight;
         this.props.onHeightChange(line.linenum, curHeight, lastHeight);
-        // console.log("line height change: ", line.linenum, lastHeight, "=>", curHeight);
     }
 
     @boundMethod
     handleClick() {
-        let { line, noSelect } = this.props;
+        const { line, noSelect } = this.props;
         if (noSelect) {
             return;
         }
-        let sel = window.getSelection();
+        const sel = window.getSelection();
         if (this.lineRef.current != null) {
-            let selText = sel.toString();
+            const selText = sel.toString();
             if (sel.anchorNode != null && this.lineRef.current.contains(sel.anchorNode) && !isBlank(selText)) {
                 return;
             }
@@ -325,68 +555,18 @@ class LineCmd extends React.Component<
         GlobalCommandRunner.screenSelectLine(String(line.linenum), "cmd");
     }
 
-    @boundMethod
-    clickStar() {
-        let { line } = this.props;
-        if (!line.star || line.star == 0) {
-            GlobalCommandRunner.lineStar(line.lineid, 1);
-        } else {
-            GlobalCommandRunner.lineStar(line.lineid, 0);
-        }
-    }
-
-    @boundMethod
-    clickPin() {
-        let { line } = this.props;
-        if (!line.pinned) {
-            GlobalCommandRunner.linePin(line.lineid, true);
-        } else {
-            GlobalCommandRunner.linePin(line.lineid, false);
-        }
-    }
-
-    @boundMethod
-    clickBookmark() {
-        let { line } = this.props;
-        GlobalCommandRunner.lineBookmark(line.lineid);
-    }
-
-    @boundMethod
-    clickMinimise() {
-        mobx.action(() => {
-            this.isMinimised.set(!this.isMinimised.get());
-        })();
-    }
-
-    @boundMethod
-    handleResizeButton() {
-        console.log("resize button");
-    }
-
-    getIsHidePrompt(): boolean {
-        let { line } = this.props;
-        let rendererPlugin: RendererPluginType = null;
-        let isNoneRenderer = line.renderer == "none";
-        if (!isBlank(line.renderer) && line.renderer != "terminal" && !isNoneRenderer) {
-            rendererPlugin = PluginModel.getRendererPluginByName(line.renderer);
-        }
-        let hidePrompt = rendererPlugin != null && rendererPlugin.hidePrompt;
-        return hidePrompt;
-    }
-
     getTerminalRendererHeight(cmd: Cmd): number {
-        let { screen, line, width, renderMode } = this.props;
-        let height = 45 + 24; // height of zero height terminal
-        let usedRows = screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, width);
-        if (usedRows > 0) {
-            height = 48 + 24 + termHeightFromRows(usedRows, GlobalModel.termFontSize.get());
+        const { screen, line, width } = this.props;
+        const usedRows = screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, width);
+        if (usedRows == 0) {
+            return 0;
         }
-        return height;
+        return termHeightFromRows(usedRows, GlobalModel.getTermFontSize(), cmd.getTermMaxRows());
     }
 
     @boundMethod
     onAvatarRightClick(e: any): void {
-        let { line, noSelect } = this.props;
+        const { line, noSelect } = this.props;
         if (noSelect) {
             return;
         }
@@ -400,20 +580,20 @@ class LineCmd extends React.Component<
     }
 
     renderSimple() {
-        let { screen, line } = this.props;
-        let cmd = screen.getCmd(line);
-        let height: number = 0;
+        const { screen, line } = this.props;
+        const cmd = screen.getCmd(line);
+        let contentHeight: number = 0;
         if (isBlank(line.renderer) || line.renderer == "terminal") {
-            height = this.getTerminalRendererHeight(cmd);
+            contentHeight = this.getTerminalRendererHeight(cmd);
         } else {
-            // header is 16px tall with hide-prompt, 36px otherwise
-            let { screen, line, width } = this.props;
-            let hidePrompt = this.getIsHidePrompt();
-            let usedRows = screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, width);
-            height = (hidePrompt ? 16 + 6 : 36 + 6) + usedRows;
+            const { screen, line, width } = this.props;
+            contentHeight = screen.getUsedRows(lineutil.getRendererContext(line), line, cmd, width);
         }
-        let formattedTime = lineutil.getLineDateTimeStr(line.ts);
-        let mainDivCn = cn("line", "line-cmd", "line-simple");
+        const mainDivCn = clsx("line", "line-cmd");
+        if (DebugHeightProblems && line.linenum >= MinLine && line.linenum <= MaxLine) {
+            heightLog[line.linenum] = heightLog[line.linenum] || {};
+            heightLog[line.linenum].contentHeight = contentHeight;
+        }
         return (
             <div
                 className={mainDivCn}
@@ -421,69 +601,31 @@ class LineCmd extends React.Component<
                 data-lineid={line.lineid}
                 data-linenum={line.linenum}
                 data-screenid={line.screenid}
-                style={{ height: height }}
             >
-                <div className="simple-line-header">
-                    <SmallLineAvatar line={line} cmd={cmd} />
-                    <div className="ts">{formattedTime}</div>
-                </div>
-            </div>
-        );
-    }
-
-    @boundMethod
-    handleLineSettings(e: any): void {
-        e.preventDefault();
-        e.stopPropagation();
-        let { line } = this.props;
-        if (line != null) {
-            mobx.action(() => {
-                GlobalModel.lineSettingsModal.set(line.linenum);
-            })();
-            GlobalModel.modalsModel.pushModal(constants.LINE_SETTINGS);
-        }
-    }
-
-    renderMeta1(cmd: Cmd) {
-        let { line } = this.props;
-        let termOpts = cmd.getTermOpts();
-        let formattedTime = lineutil.getLineDateTimeStr(line.ts);
-        let renderer = line.renderer;
-        return (
-            <div key="meta1" className="meta meta-line1">
-                <SmallLineAvatar line={line} cmd={cmd} />
-                <div className="ts">{formattedTime}</div>
-                <div>&nbsp;</div>
-                <If condition={!isBlank(renderer) && renderer != "terminal"}>
-                    <div className="renderer">
-                        <FillIcon />
-                        {renderer}&nbsp;
-                    </div>
-                </If>
-                <div className="termopts">
-                    ({termOpts.rows}x{termOpts.cols})
-                </div>
-                <div className="settings hoverEffect" onClick={this.handleLineSettings}>
-                    <GearIcon />
-                </div>
+                <LineHeader screen={screen} line={line} cmd={cmd} />
+                <div
+                    className={clsx("line-content", { "zero-height": contentHeight == 0 })}
+                    style={{ height: contentHeight }}
+                />
             </div>
         );
     }
 
     getRendererOpts(cmd: Cmd): RendererOpts {
-        let { screen } = this.props;
+        const { screen } = this.props;
         return {
             maxSize: screen.getMaxContentSize(),
             idealSize: screen.getIdealContentSize(),
             termOpts: cmd.getTermOpts(),
-            termFontSize: GlobalModel.termFontSize.get(),
+            termFontSize: GlobalModel.getTermFontSize(),
+            termFontFamily: GlobalModel.getTermFontFamily(),
         };
     }
 
     makeRendererModelInitializeParams(): RendererModelInitializeParams {
-        let { screen, line } = this.props;
-        let context = lineutil.getRendererContext(line);
-        let cmd = screen.getCmd(line); // won't be null
+        const { screen, line } = this.props;
+        const context = lineutil.getRendererContext(line);
+        const cmd = screen.getCmd(line); // won't be null
         let savedHeight = screen.getContentHeight(context);
         if (savedHeight == null) {
             if (line.contentheight != null && line.contentheight != -1) {
@@ -492,7 +634,7 @@ class LineCmd extends React.Component<
                 savedHeight = 0;
             }
         }
-        let api = {
+        const api = {
             saveHeight: (height: number) => {
                 screen.setContentHeight(lineutil.getRendererContext(line), height);
             },
@@ -545,13 +687,90 @@ class LineCmd extends React.Component<
         };
     };
 
+    @boundMethod
+    handleContextMenu(e: React.MouseEvent) {
+        e.preventDefault();
+        e.stopPropagation();
+        let { line, screen } = this.props;
+        const containerType = screen.getContainerType();
+        const isMainContainer = containerType == appconst.LineContainer_Main;
+        const cmd = screen.getCmd(line);
+        let menu: ContextMenuItem[] = [
+            { role: "copy", label: "Copy", type: "normal" },
+            { role: "paste", label: "Paste", type: "normal" },
+            { type: "separator" },
+            { label: "Copy Command", click: () => this.copyCommandStr() },
+        ];
+        const isTerminal = isBlank(line.renderer) || line.renderer == "terminal";
+        if (isTerminal) {
+            menu.push({ label: "Copy Visible Output", click: () => this.copyOutput(false) });
+            menu.push({ label: "Copy Full Output", click: () => this.copyOutput(true) });
+        }
+        if (isMainContainer) {
+            menu.push({ type: "separator" });
+            const isMinimized = line.linestate["wave:min"];
+            if (isMinimized) {
+                menu.push({
+                    label: "Show Block Output",
+                    click: () => GlobalCommandRunner.lineMinimize(line.lineid, false, true),
+                });
+            } else {
+                menu.push({
+                    label: "Hide Block Output",
+                    click: () => GlobalCommandRunner.lineMinimize(line.lineid, true, true),
+                });
+            }
+            if (cmd?.isRunning()) {
+                menu.push({ type: "separator" });
+                menu.push({
+                    label: "Send Signal",
+                    type: "submenu",
+                    submenu: [
+                        { label: "SIGINT", click: () => GlobalCommandRunner.lineSignal(line.lineid, "SIGINT", true) },
+                        { label: "SIGTERM", click: () => GlobalCommandRunner.lineSignal(line.lineid, "SIGTERM", true) },
+                        { label: "SIGKILL", click: () => GlobalCommandRunner.lineSignal(line.lineid, "SIGKILL", true) },
+                        { type: "separator" },
+                        { label: "SIGUSR1", click: () => GlobalCommandRunner.lineSignal(line.lineid, "SIGUSR1", true) },
+                        { label: "SIGUSR2", click: () => GlobalCommandRunner.lineSignal(line.lineid, "SIGUSR2", true) },
+                    ],
+                });
+            }
+
+            menu.push({ type: "separator" });
+            menu.push({ label: "Restart Line", click: () => GlobalCommandRunner.lineRestart(line.lineid, true) });
+            menu.push({ type: "separator" });
+            menu.push({ label: "Delete Block", click: () => GlobalCommandRunner.lineDelete(line.lineid, true) });
+        }
+        GlobalModel.contextMenuModel.showContextMenu(menu, { x: e.clientX, y: e.clientY });
+    }
+
+    copyCommandStr() {
+        const { line, screen } = this.props;
+        const cmd: Cmd = screen.getCmd(line);
+        if (cmd != null) {
+            navigator.clipboard.writeText(cmd.getCmdStr());
+        }
+    }
+
+    copyOutput(fullOutput: boolean) {
+        const { line, screen } = this.props;
+        let termWrap = screen.getTermWrap(line.lineid);
+        if (termWrap == null) {
+            return;
+        }
+        let outputStr = termWrap.getOutput(fullOutput);
+        if (fullOutput != null) {
+            navigator.clipboard.writeText(outputStr);
+        }
+    }
+
     render() {
-        let { screen, line, width, staticRender, visible } = this.props;
-        let isVisible = visible.get();
+        const { screen, line, width, staticRender, visible } = this.props;
+        const isVisible = visible.get();
         if (staticRender || !isVisible) {
             return this.renderSimple();
         }
-        let cmd = screen.getCmd(line);
+        const cmd = screen.getCmd(line);
         if (cmd == null) {
             return (
                 <div
@@ -565,60 +784,63 @@ class LineCmd extends React.Component<
                 </div>
             );
         }
-        let status = cmd.getStatus();
-        let lineNumStr = (line.linenumtemp ? "~" : "") + String(line.linenum);
-        let isSelected = mobx
+        const isRtnState = cmd.getRtnState() && false; // turning off rtnstate for now
+        const isSelected = mobx
             .computed(() => screen.getSelectedLine() == line.linenum, {
                 name: "computed-isSelected",
             })
             .get();
-        let isPhysicalFocused = mobx
+        const isPhysicalFocused = mobx
             .computed(() => screen.getIsFocused(line.linenum), {
                 name: "computed-getIsFocused",
             })
             .get();
-        let isFocused = mobx
+        const isFocused = mobx
             .computed(
                 () => {
-                    let screenFocusType = screen.getFocusType();
+                    const screenFocusType = screen.getFocusType();
                     return isPhysicalFocused && screenFocusType == "cmd";
                 },
                 { name: "computed-isFocused" }
             )
             .get();
-        let shouldCmdFocus = mobx
+        const shouldCmdFocus = mobx
             .computed(
                 () => {
-                    let screenFocusType = screen.getFocusType();
+                    const screenFocusType = screen.getFocusType();
                     return isSelected && screenFocusType == "cmd";
                 },
                 { name: "computed-shouldCmdFocus" }
             )
             .get();
-        let isStatic = staticRender;
-        let isRunning = cmd.isRunning();
-        let isExpanded = this.isCmdExpanded.get();
-        let rsdiff = this.rtnStateDiff.get();
-        let mainDivCn = cn(
+        const isInSidebar = mobx
+            .computed(
+                () => {
+                    return screen.isSidebarOpen() && screen.isLineIdInSidebar(line.lineid);
+                },
+                { name: "computed-isInSidebar" }
+            )
+            .get();
+        const isRunning = cmd.isRunning();
+        const cmdError = cmdShouldMarkError(cmd);
+        const mainDivCn = clsx(
             "line",
             "line-cmd",
             { selected: isSelected },
             { active: isSelected && isFocused },
             { "cmd-done": !isRunning },
-            { "has-rtnstate": cmd.getRtnState() }
+            { "has-rtnstate": isRtnState },
+            { "has-error": cmdError }
         );
         let rendererPlugin: RendererPluginType = null;
-        let isNoneRenderer = line.renderer == "none";
+        const isNoneRenderer = line.renderer == "none";
         if (!isBlank(line.renderer) && line.renderer != "terminal" && !isNoneRenderer) {
             rendererPlugin = PluginModel.getRendererPluginByName(line.renderer);
         }
-        let rendererType = lineutil.getRendererType(line);
-        let hidePrompt = rendererPlugin != null && rendererPlugin.hidePrompt;
-        let termFontSize = GlobalModel.termFontSize.get();
-        let rtnStateDiffSize = termFontSize - 2;
-        if (rtnStateDiffSize < 10) {
-            rtnStateDiffSize = Math.max(termFontSize, 10);
-        }
+        const rendererType = lineutil.getRendererType(line);
+        const termFontSize = GlobalModel.getTermFontSize();
+        const containerType = screen.getContainerType();
+        const isMinimized = line.linestate["wave:min"] && containerType == appconst.LineContainer_Main;
         return (
             <div
                 className={mainDivCn}
@@ -627,108 +849,71 @@ class LineCmd extends React.Component<
                 data-lineid={line.lineid}
                 data-linenum={line.linenum}
                 data-screenid={line.screenid}
+                onContextMenu={this.handleContextMenu}
             >
-                <div
-                    key="header"
-                    className={cn("line-header", { "is-expanded": isExpanded }, { "hide-prompt": hidePrompt })}
-                >
-                    <div key="meta" className="meta-wrap">
-                        {this.renderMeta1(cmd)}
-                        <If condition={!hidePrompt}>{this.renderCmdText(cmd)}</If>
-                    </div>
-                    <div
-                        key="pin"
-                        title="Pin"
-                        className={cn("line-icon", { active: line.pinned })}
-                        onClick={this.clickPin}
-                        style={{ display: "none" }}
-                    >
-                        <PinIcon className="icon" />
-                    </div>
-                    <div
-                        key="bookmark"
-                        title="Bookmark"
-                        className={cn("line-icon", "line-bookmark", "hoverEffect")}
-                        onClick={this.clickBookmark}
-                    >
-                        <FavoritesIcon className="icon" />
-                    </div>
-                    <div
-                        key="minimise"
-                        title={`${this.isMinimised.get() ? "Maximise" : "Minimise"}`}
-                        className={cn(
-                            "line-icon",
-                            "line-minimise",
-                            "hoverEffect",
-                            this.isMinimised.get() ? "line-icon-show" : ""
-                        )}
-                        onClick={this.clickMinimise}
-                    >
-                        {this.isMinimised.get() ? <PlusIcon className="icon plus" /> : <MinusIcon className="icon" />}
-                    </div>
-                </div>
-                <If condition={!this.isMinimised.get()}>
-                    <ErrorBoundary plugin={rendererPlugin?.name} lineContext={lineutil.getRendererContext(line)}>
-                        <If condition={rendererPlugin == null && !isNoneRenderer}>
-                            <TerminalRenderer
-                                screen={screen}
-                                line={line}
-                                width={width}
-                                staticRender={staticRender}
-                                visible={visible}
-                                onHeightChange={this.handleHeightChange}
-                                collapsed={false}
-                            />
-                        </If>
-                        <If condition={rendererPlugin != null && rendererPlugin.rendererType == "simple"}>
-                            <SimpleBlobRenderer
-                                rendererContainer={screen}
-                                lineId={line.lineid}
-                                plugin={rendererPlugin}
-                                onHeightChange={this.handleHeightChange}
-                                initParams={this.makeRendererModelInitializeParams()}
-                                scrollToBringIntoViewport={this.scrollToBringIntoViewport}
-                                isSelected={isSelected}
-                                shouldFocus={shouldCmdFocus}
-                            />
-                        </If>
-                        <If condition={rendererPlugin != null && rendererPlugin.rendererType == "full"}>
-                            <IncrementalRenderer
-                                rendererContainer={screen}
-                                lineId={line.lineid}
-                                plugin={rendererPlugin}
-                                onHeightChange={this.handleHeightChange}
-                                initParams={this.makeRendererModelInitializeParams()}
-                                isSelected={isSelected}
-                            />
-                        </If>
-                    </ErrorBoundary>
-                    <If condition={cmd.getRtnState()}>
-                        <div
-                            key="rtnstate"
-                            className="cmd-rtnstate"
-                            style={{
-                                visibility: cmd.getStatus() == "done" ? "visible" : "hidden",
-                            }}
-                        >
-                            <If condition={rsdiff == null || rsdiff == ""}>
-                                <div className="cmd-rtnstate-label">state unchanged</div>
-                                <div className="cmd-rtnstate-sep"></div>
+                <If condition={isSelected || cmdError}>
+                    <div key="mask" className={clsx("line-mask", { "error-mask": cmdError })}></div>
+                </If>
+                <LineActions screen={screen} line={line} cmd={cmd} />
+                <LineHeader screen={screen} line={line} cmd={cmd} />
+                <If condition={!isMinimized}>
+                    <Choose>
+                        <When condition={isInSidebar}>
+                            <div className="sidebar-message" style={{ fontSize: termFontSize }}>
+                                &nbsp;&nbsp;showing in sidebar =&gt;
+                            </div>
+                        </When>
+                        <Otherwise>
+                            <ErrorBoundary
+                                plugin={rendererPlugin?.name}
+                                lineContext={lineutil.getRendererContext(line)}
+                            >
+                                <If condition={rendererPlugin == null && !isNoneRenderer}>
+                                    <TerminalRenderer
+                                        screen={screen}
+                                        line={line}
+                                        width={width}
+                                        staticRender={staticRender}
+                                        visible={visible}
+                                        onHeightChange={this.handleHeightChange}
+                                        collapsed={false}
+                                    />
+                                </If>
+                                <If condition={rendererPlugin != null && rendererPlugin.rendererType == "simple"}>
+                                    <SimpleBlobRenderer
+                                        rendererContainer={screen}
+                                        lineId={line.lineid}
+                                        plugin={rendererPlugin}
+                                        onHeightChange={this.handleHeightChange}
+                                        initParams={this.makeRendererModelInitializeParams()}
+                                        scrollToBringIntoViewport={this.scrollToBringIntoViewport}
+                                        isSelected={isSelected}
+                                        shouldFocus={shouldCmdFocus}
+                                    />
+                                </If>
+                                <If condition={rendererPlugin != null && rendererPlugin.rendererType == "full"}>
+                                    <IncrementalRenderer
+                                        rendererContainer={screen}
+                                        lineId={line.lineid}
+                                        plugin={rendererPlugin}
+                                        onHeightChange={this.handleHeightChange}
+                                        initParams={this.makeRendererModelInitializeParams()}
+                                        isSelected={isSelected}
+                                    />
+                                </If>
+                            </ErrorBoundary>
+                            <If condition={isRtnState}>
+                                <RtnState cmd={cmd} line={line} />
                             </If>
-                            <If condition={rsdiff != null && rsdiff != ""}>
-                                <div className="cmd-rtnstate-label">new state</div>
-                                <div className="cmd-rtnstate-sep"></div>
-                                <div className="cmd-rtnstate-diff" style={{ fontSize: rtnStateDiffSize }}>
-                                    <div className="cmd-rtnstate-diff-inner">{this.rtnStateDiff.get()}</div>
+                            <If condition={isSelected && !isFocused && rendererType == "terminal"}>
+                                <div className="cmd-hints">
+                                    <div className="hint-item color-nohover-white">
+                                        focus line ({renderCmdText("L")})
+                                    </div>
                                 </div>
                             </If>
-                        </div>
-                    </If>
-                    <If condition={isSelected && !isFocused && rendererType == "terminal"}>
-                        <div className="cmd-hints">
-                            <div className="hint-item color-nohover-white">focus line ({renderCmdText("L")})</div>
-                        </div>
-                    </If>
+                        </Otherwise>
+                    </Choose>
                 </If>
             </div>
         );
@@ -738,7 +923,7 @@ class LineCmd extends React.Component<
 @mobxReact.observer
 class Line extends React.Component<
     {
-        screen: LineContainerModel;
+        screen: LineContainerType;
         line: LineType;
         width: number;
         staticRender: boolean;
@@ -752,7 +937,7 @@ class Line extends React.Component<
     {}
 > {
     render() {
-        let line = this.props.line;
+        const line = this.props.line;
         if (line.archived) {
             return null;
         }
@@ -769,7 +954,7 @@ class Line extends React.Component<
 @mobxReact.observer
 class LineText extends React.Component<
     {
-        screen: LineContainerModel;
+        screen: LineContainerType;
         line: LineType;
         renderMode: RenderModeType;
         noSelect?: boolean;
@@ -778,7 +963,7 @@ class LineText extends React.Component<
 > {
     @boundMethod
     clickHandler() {
-        let { line, noSelect } = this.props;
+        const { line, noSelect } = this.props;
         if (noSelect) {
             return;
         }
@@ -787,7 +972,7 @@ class LineText extends React.Component<
 
     @boundMethod
     onAvatarRightClick(e: any): void {
-        let { line, noSelect } = this.props;
+        const { line, noSelect } = this.props;
         if (noSelect) {
             return;
         }
@@ -801,19 +986,14 @@ class LineText extends React.Component<
     }
 
     render() {
-        let { screen, line, renderMode } = this.props;
-        let formattedTime = lineutil.getLineDateTimeStr(line.ts);
-        let isSelected = mobx
+        const { screen, line } = this.props;
+        const formattedTime = lineutil.getLineDateTimeStr(line.ts);
+        const isSelected = mobx
             .computed(() => screen.getSelectedLine() == line.linenum, {
                 name: "computed-isSelected",
             })
             .get();
-        let isFocused = mobx
-            .computed(() => screen.getFocusType() == "cmd", {
-                name: "computed-isFocused",
-            })
-            .get();
-        let mainClass = cn("line", "line-text", "focus-parent");
+        const mainClass = clsx("line", "line-text", "focus-parent", { selected: isSelected });
         return (
             <div
                 className={mainClass}
@@ -822,13 +1002,18 @@ class LineText extends React.Component<
                 data-screenid={line.screenid}
                 onClick={this.clickHandler}
             >
-                <div className={cn("focus-indicator", { selected: isSelected }, { active: isSelected && isFocused })} />
-                <div className="line-content">
-                    <div className="meta">
+                <If condition={isSelected}>
+                    <div key="mask" className="line-mask"></div>
+                </If>
+                <div key="header" className="line-header">
+                    <div className="meta meta-line1">
                         <SmallLineAvatar line={line} cmd={null} onRightClick={this.onAvatarRightClick} />
+                        <div className="meta-divider">|</div>
                         <div className="ts">{formattedTime}</div>
                     </div>
-                    <div className="text">{line.text}</div>
+                </div>
+                <div key="text" className="text">
+                    {line.text}
                 </div>
             </div>
         );

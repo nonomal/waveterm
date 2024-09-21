@@ -6,41 +6,126 @@ import * as mobxReact from "mobx-react";
 import * as mobx from "mobx";
 import { sprintf } from "sprintf-js";
 import { boundMethod } from "autobind-decorator";
-import { For } from "tsx-control-statements/components";
-import cn from "classnames";
-import { debounce } from "throttle-debounce";
-import dayjs from "dayjs";
-import localizedFormat from "dayjs/plugin/localizedFormat";
-import { GlobalModel, GlobalCommandRunner, Session, Screen } from "../../../model/model";
-import { renderCmdText } from "../../common/common";
-import { ReactComponent as SquareIcon } from "../../assets/icons/tab/square.svg";
-import { ReactComponent as ActionsIcon } from "../../assets/icons/tab/actions.svg";
-import { ReactComponent as AddIcon } from "../../assets/icons/add.svg";
-import * as constants from "../../appconst";
+import { For, If } from "tsx-control-statements/components";
+import { clsx } from "clsx";
+import { GlobalModel, GlobalCommandRunner, Session, Screen } from "@/models";
+import { ReactComponent as AddIcon } from "@/assets/icons/add.svg";
+import { Reorder } from "framer-motion";
+import { ScreenTab } from "./tab";
 
-import "../workspace.less";
 import "./tabs.less";
 
-dayjs.extend(localizedFormat);
-
-type OV<V> = mobx.IObservableValue<V>;
-
 @mobxReact.observer
-class ScreenTabs extends React.Component<{ session: Session }, {}> {
+class ScreenTabs extends React.Component<
+    { session: Session },
+    { showingScreens: Screen[]; scrollIntoViewTimeout: number }
+> {
     tabsRef: React.RefObject<any> = React.createRef();
     lastActiveScreenId: string = null;
-    scrolling: OV<boolean> = mobx.observable.box(false, { name: "screentabs-scrolling" });
-
-    stopScrolling_debounced: () => void;
+    dragEndTimeout = null;
+    scrollIntoViewTimeoutId = null;
+    deltaYHistory = [];
+    disposeScreensReaction = null;
 
     constructor(props: any) {
         super(props);
-        this.stopScrolling_debounced = debounce(1500, this.stopScrolling.bind(this));
+        this.state = {
+            showingScreens: [],
+            scrollIntoViewTimeout: 0,
+        };
+    }
+
+    componentDidMount(): void {
+        // handle initial scrollIntoView
+        this.componentDidUpdate();
+
+        // populate showingScreens state
+        this.setState({ showingScreens: this.getScreens() });
+        // Update showingScreens state when the screens change
+        this.disposeScreensReaction = mobx.reaction(
+            () => this.getScreens(),
+            (screens) => {
+                // Different timeout for when screens are added vs removed
+                let timeout = 100;
+                if (screens.length < this.state.showingScreens.length) {
+                    timeout = 400;
+                }
+                this.setState({ showingScreens: screens, scrollIntoViewTimeout: timeout });
+            }
+        );
+
+        // Add the wheel event listener to the tabsRef
+        if (this.tabsRef.current) {
+            this.tabsRef.current.addEventListener("wheel", this.handleWheel, { passive: false });
+        }
+    }
+
+    componentWillUnmount() {
+        if (this.dragEndTimeout) {
+            clearTimeout(this.dragEndTimeout);
+        }
+
+        if (this.disposeScreensReaction) {
+            this.disposeScreensReaction(); // Clean up the reaction
+        }
+    }
+
+    componentDidUpdate(): void {
+        // Scroll the active screen into view
+        let activeScreenId = this.getActiveScreenId();
+        if (activeScreenId !== this.lastActiveScreenId) {
+            if (this.scrollIntoViewTimeoutId) {
+                clearTimeout(this.scrollIntoViewTimeoutId);
+            }
+            this.lastActiveScreenId = activeScreenId;
+            this.scrollIntoViewTimeoutId = setTimeout(() => {
+                if (!this.tabsRef.current) {
+                    return;
+                }
+                let tabElem = this.tabsRef.current.querySelector(
+                    sprintf('.screen-tab[data-screenid="%s"]', activeScreenId)
+                );
+                if (!tabElem) {
+                    return;
+                }
+                tabElem.scrollIntoView();
+            }, this.state.scrollIntoViewTimeout);
+        }
+    }
+
+    @boundMethod
+    getActiveScreenId(): string {
+        let { session } = this.props;
+        if (session) {
+            return session.activeScreenId.get();
+        }
+        return null;
+    }
+
+    @mobx.computed
+    @boundMethod
+    getScreens(): Screen[] {
+        let activeScreenId = this.getActiveScreenId();
+        if (!activeScreenId) {
+            return [];
+        }
+
+        let screens = GlobalModel.getSessionScreens(this.props.session.sessionId);
+        let showingScreens = [];
+
+        for (const screen of screens) {
+            if (!screen.archived.get() || activeScreenId === screen.screenId) {
+                showingScreens.push(screen);
+            }
+        }
+
+        showingScreens.sort((a, b) => a.screenIdx.get() - b.screenIdx.get());
+
+        return showingScreens;
     }
 
     @boundMethod
     handleNewScreen() {
-        let { session } = this.props;
         GlobalCommandRunner.createNewScreen();
     }
 
@@ -60,148 +145,70 @@ class ScreenTabs extends React.Component<{ session: Session }, {}> {
         GlobalCommandRunner.switchScreen(screenId);
     }
 
-    componentDidMount(): void {
-        this.componentDidUpdate();
-    }
-
-    componentDidUpdate(): void {
-        let { session } = this.props;
-        let activeScreenId = session.activeScreenId.get();
-        if (activeScreenId != this.lastActiveScreenId && this.tabsRef.current) {
-            let tabElem = this.tabsRef.current.querySelector(
-                sprintf('.screen-tab[data-screenid="%s"]', activeScreenId)
-            );
-            if (tabElem != null) {
-                tabElem.scrollIntoView();
-            }
-        }
-        this.lastActiveScreenId = activeScreenId;
-    }
-
-    stopScrolling(): void {
-        mobx.action(() => {
-            this.scrolling.set(false);
-        })();
-    }
-
     @boundMethod
-    handleScroll() {
-        if (!this.scrolling.get()) {
-            mobx.action(() => {
-                this.scrolling.set(true);
-            })();
+    handleWheel(event: WheelEvent) {
+        if (!this.tabsRef.current) return;
+
+        // Add the current deltaY to the history
+        this.deltaYHistory.push(Math.abs(event.deltaY));
+        if (this.deltaYHistory.length > 5) {
+            this.deltaYHistory.shift(); // Keep only the last 5 entries
         }
-        this.stopScrolling_debounced();
-    }
 
-    @boundMethod
-    openScreenSettings(e: any, screen: Screen): void {
-        e.preventDefault();
-        e.stopPropagation();
-        mobx.action(() => {
-            GlobalModel.screenSettingsModal.set({ sessionId: screen.sessionId, screenId: screen.screenId });
-        })();
-        GlobalModel.modalsModel.pushModal(constants.SCREEN_SETTINGS);
-    }
+        // Check if any of the last 5 deltaY values are greater than a threshold
+        let isMouseWheel = this.deltaYHistory.some((deltaY) => deltaY > 0);
 
-    renderTabIcon = (screen: Screen): React.ReactNode => {
-        const tabIcon = screen.getTabIcon();
-        if (tabIcon === "default" || tabIcon === "square") {
-            return (
-                <div className="icon svg-icon">
-                    <SquareIcon className="left-icon" />
-                </div>
-            );
+        if (isMouseWheel) {
+            // It's likely a mouse wheel event, so handle it for horizontal scrolling
+            this.tabsRef.current.scrollLeft += event.deltaY;
+
+            // Prevent default vertical scroll
+            event.preventDefault();
         }
-        return (
-            <div className="icon fa-icon">
-                <i className={`fa-sharp fa-solid fa-${tabIcon}`}></i>
-            </div>
-        );
-    };
-
-    renderTab(screen: Screen, activeScreenId: string, index: number): JSX.Element {
-        let tabIndex = null;
-        if (index + 1 <= 9) {
-            tabIndex = <div className="tab-index">{renderCmdText(String(index + 1))}</div>;
-        }
-        let settings = (
-            <div onClick={(e) => this.openScreenSettings(e, screen)} title="Actions" className="tab-gear">
-                <ActionsIcon className="icon hoverEffect " />
-            </div>
-        );
-        let archived = screen.archived.get() ? (
-            <i title="archived" className="fa-sharp fa-solid fa-box-archive" />
-        ) : null;
-
-        let webShared = screen.isWebShared() ? (
-            <i title="shared to web" className="fa-sharp fa-solid fa-share-nodes web-share-icon" />
-        ) : null;
-
-        return (
-            <div
-                key={screen.screenId}
-                data-screenid={screen.screenId}
-                className={cn(
-                    "screen-tab",
-                    { "is-active": activeScreenId == screen.screenId, "is-archived": screen.archived.get() },
-                    "color-" + screen.getTabColor()
-                )}
-                onClick={() => this.handleSwitchScreen(screen.screenId)}
-                onContextMenu={(event) => this.openScreenSettings(event, screen)}
-            >
-                {this.renderTabIcon(screen)}
-                <div className="tab-name truncate">
-                    {archived}
-                    {webShared}
-                    {screen.name.get()}
-                </div>
-                {tabIndex}
-                {settings}
-            </div>
-        );
+        // For touchpad events, do nothing and let the browser handle it
     }
 
     render() {
+        let { showingScreens } = this.state;
         let { session } = this.props;
         if (session == null) {
             return null;
         }
         let screen: Screen | null = null;
         let index = 0;
-        let showingScreens = [];
-        let activeScreenId = session.activeScreenId.get();
-        let screens = GlobalModel.getSessionScreens(session.sessionId);
-        for (let screen of screens) {
-            if (!screen.archived.get() || activeScreenId == screen.screenId) {
-                showingScreens.push(screen);
-            }
-        }
-        showingScreens.sort((a, b) => {
-            let aidx = a.screenIdx.get();
-            let bidx = b.screenIdx.get();
-            if (aidx < bidx) {
-                return -1;
-            }
-            if (aidx > bidx) {
-                return 1;
-            }
-            return 0;
-        });
+        let activeScreenId = this.getActiveScreenId();
         return (
             <div className="screen-tabs-container">
+                {/* Inner container ensures that hovering over the scrollbar doesn't trigger the hover effect on the tabs. This prevents weird flickering of the icons when the mouse is moved over the scrollbar. */}
                 <div
-                    className={cn("screen-tabs", { scrolling: this.scrolling.get() })}
-                    ref={this.tabsRef}
-                    onScroll={this.handleScroll}
+                    key="container-inner"
+                    className="screen-tabs-container-inner no-highlight-scrollbar scrollbar-hide-until-hover"
                 >
-                    <For each="screen" index="index" of={showingScreens}>
-                        {this.renderTab(screen, activeScreenId, index)}
-                    </For>
-                    <div key="new-screen" className="new-screen" onClick={this.handleNewScreen}>
-                        <AddIcon className="icon hoverEffect" />
-                    </div>
+                    <Reorder.Group
+                        className="screen-tabs"
+                        ref={this.tabsRef}
+                        as="ul"
+                        axis="x"
+                        onReorder={(tabs: Screen[]) => {
+                            this.setState({ showingScreens: tabs });
+                        }}
+                        values={showingScreens}
+                    >
+                        <For each="screen" index="index" of={showingScreens}>
+                            <ScreenTab
+                                key={screen.screenId}
+                                screen={screen}
+                                activeScreenId={activeScreenId}
+                                index={index}
+                                onSwitchScreen={this.handleSwitchScreen}
+                            />
+                        </For>
+                    </Reorder.Group>
                 </div>
+                <div key="new-screen" className="new-screen" onClick={this.handleNewScreen}>
+                    <AddIcon className="icon hoverEffect" />
+                </div>
+                <div key="spacer" className="tabs-end-spacer" />
             </div>
         );
     }

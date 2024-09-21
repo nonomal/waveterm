@@ -7,20 +7,24 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/wavetermdev/waveterm/waveshell/pkg/packet"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/configstore"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/mapqueue"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/remote"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/scbus"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/scpacket"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/sstore"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/telemetry"
+	"github.com/wavetermdev/waveterm/wavesrv/pkg/userinput"
 	"github.com/wavetermdev/waveterm/wavesrv/pkg/wsshell"
 )
 
 const WSStatePacketChSize = 20
-const MaxInputDataSize = 1000
 const RemoteInputQueueSize = 100
 
 var RemoteInputMapQueue *mapqueue.MapQueue
@@ -34,8 +38,8 @@ type WSState struct {
 	ClientId      string
 	ConnectTime   time.Time
 	Shell         *wsshell.WSShell
-	UpdateCh      chan interface{}
-	UpdateQueue   []interface{}
+	UpdateCh      chan scbus.UpdatePacket
+	UpdateQueue   []any
 	Authenticated bool
 	AuthKey       string
 
@@ -70,7 +74,7 @@ func (ws *WSState) GetShell() *wsshell.WSShell {
 	return ws.Shell
 }
 
-func (ws *WSState) WriteUpdate(update interface{}) error {
+func (ws *WSState) WriteUpdate(update any) error {
 	shell := ws.GetShell()
 	if shell == nil {
 		return fmt.Errorf("cannot write update, empty shell")
@@ -102,26 +106,21 @@ func (ws *WSState) WatchScreen(sessionId string, screenId string) {
 	}
 	ws.SessionId = sessionId
 	ws.ScreenId = screenId
-	ws.UpdateCh = sstore.MainBus.RegisterChannel(ws.ClientId, ws.ScreenId)
+	ws.UpdateCh = scbus.MainUpdateBus.RegisterChannel(ws.ClientId, &scbus.UpdateChannel{ScreenId: ws.ScreenId})
+	log.Printf("[ws] watch screen clientid=%s sessionid=%s screenid=%s, updateCh=%v\n", ws.ClientId, sessionId, screenId, ws.UpdateCh)
 	go ws.RunUpdates(ws.UpdateCh)
 }
 
 func (ws *WSState) UnWatchScreen() {
 	ws.Lock.Lock()
 	defer ws.Lock.Unlock()
-	sstore.MainBus.UnregisterChannel(ws.ClientId)
+	scbus.MainUpdateBus.UnregisterChannel(ws.ClientId)
 	ws.SessionId = ""
 	ws.ScreenId = ""
 	log.Printf("[ws] unwatch screen clientid=%s\n", ws.ClientId)
 }
 
-func (ws *WSState) getUpdateCh() chan interface{} {
-	ws.Lock.Lock()
-	defer ws.Lock.Unlock()
-	return ws.UpdateCh
-}
-
-func (ws *WSState) RunUpdates(updateCh chan interface{}) {
+func (ws *WSState) RunUpdates(updateCh chan scbus.UpdatePacket) {
 	if updateCh == nil {
 		panic("invalid nil updateCh passed to RunUpdates")
 	}
@@ -140,7 +139,6 @@ func writeJsonProtected(shell *wsshell.WSShell, update any) {
 			return
 		}
 		log.Printf("[error] in scws RunUpdates WriteJson: %v\n", r)
-		return
 	}()
 	shell.WriteJson(update)
 }
@@ -154,24 +152,28 @@ func (ws *WSState) ReplaceShell(shell *wsshell.WSShell) {
 	}
 	ws.Shell.Conn.Close()
 	ws.Shell = shell
-	return
 }
 
+// returns all state required to display current UI
 func (ws *WSState) handleConnection() error {
 	ctx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelFn()
-	update, err := sstore.GetAllSessions(ctx)
+	connectUpdate, err := sstore.GetConnectUpdate(ctx)
 	if err != nil {
 		return fmt.Errorf("getting sessions: %w", err)
 	}
 	remotes := remote.GetAllRemoteRuntimeState()
-	ifarr := make([]interface{}, len(remotes))
-	for idx, r := range remotes {
-		ifarr[idx] = r
+	connectUpdate.Remotes = remotes
+	// restore status indicators
+	connectUpdate.ScreenStatusIndicators, connectUpdate.ScreenNumRunningCommands = sstore.GetCurrentIndicatorState()
+	configs, err := configstore.ScanConfigs()
+	if err != nil {
+		return fmt.Errorf("getting configs: %w", err)
 	}
-	update.Remotes = ifarr
-	update.Connect = true
-	err = ws.Shell.WriteJson(update)
+	connectUpdate.TermThemes = &configs
+	mu := scbus.MakeUpdatePacket()
+	mu.AddUpdate(*connectUpdate)
+	err = ws.Shell.WriteJson(mu)
 	if err != nil {
 		return err
 	}
@@ -214,69 +216,105 @@ func (ws *WSState) handleWatchScreen(wsPk *scpacket.WatchScreenPacketType) error
 	return nil
 }
 
+func (ws *WSState) processMessage(msgBytes []byte) error {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		log.Printf("[scws] panic in processMessage: %v\n", r)
+		debug.PrintStack()
+	}()
+
+	pk, err := packet.ParseJsonPacket(msgBytes)
+	if err != nil {
+		return fmt.Errorf("error unmarshalling ws message: %w", err)
+	}
+	if pk.GetType() == scpacket.WatchScreenPacketStr {
+		wsPk := pk.(*scpacket.WatchScreenPacketType)
+		err := ws.handleWatchScreen(wsPk)
+		if err != nil {
+			return fmt.Errorf("client:%s error %w", ws.ClientId, err)
+		}
+		return nil
+	}
+	isAuth := ws.IsAuthenticated()
+	if !isAuth {
+		return fmt.Errorf("cannot process ws-packet[%s], not authenticated", pk.GetType())
+	}
+	if pk.GetType() == scpacket.FeInputPacketStr {
+		feInputPk := pk.(*scpacket.FeInputPacketType)
+		if feInputPk.Remote.OwnerId != "" {
+			return fmt.Errorf("error cannot send input to remote with ownerid")
+		}
+		if feInputPk.Remote.RemoteId == "" {
+			return fmt.Errorf("error invalid input packet, remoteid is not set")
+		}
+		err := RemoteInputMapQueue.Enqueue(feInputPk.Remote.RemoteId, func() {
+			sendErr := sendCmdInput(feInputPk)
+			if sendErr != nil {
+				log.Printf("[scws] sending command input: %v\n", sendErr)
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("[error] could not queue sendCmdInput: %w", err)
+		}
+		return nil
+	}
+	if pk.GetType() == scpacket.RemoteInputPacketStr {
+		inputPk := pk.(*scpacket.RemoteInputPacketType)
+		if inputPk.RemoteId == "" {
+			return fmt.Errorf("error invalid remoteinput packet, remoteid is not set")
+		}
+		go func() {
+			sendErr := remote.SendRemoteInput(inputPk)
+			if sendErr != nil {
+				log.Printf("[scws] error processing remote input: %v\n", sendErr)
+			}
+		}()
+		return nil
+	}
+	if pk.GetType() == scpacket.CmdInputTextPacketStr {
+		cmdInputPk := pk.(*scpacket.CmdInputTextPacketType)
+		if cmdInputPk.ScreenId == "" {
+			return fmt.Errorf("error invalid cmdinput packet, screenid is not set")
+		}
+		// no need for goroutine for memory ops
+		sstore.ScreenMemSetCmdInputText(cmdInputPk.ScreenId, cmdInputPk.Text, cmdInputPk.SeqNum)
+		return nil
+	}
+	if pk.GetType() == userinput.UserInputResponsePacketStr {
+		userInputRespPk := pk.(*userinput.UserInputResponsePacketType)
+		uich, ok := scbus.MainRpcBus.GetRpcChannel(userInputRespPk.RequestId)
+		if !ok {
+			return fmt.Errorf("received User Input Response with invalid Id (%s): %v", userInputRespPk.RequestId, err)
+		}
+		select {
+		case uich <- userInputRespPk:
+		default:
+		}
+		return nil
+	}
+	if pk.GetType() == scpacket.FeActivityPacketStr {
+		feActivityPk := pk.(*scpacket.FeActivityPacketType)
+		telemetry.UpdateFeActivityWrap(feActivityPk)
+		return nil
+	}
+	return fmt.Errorf("got ws bad message: %v", pk.GetType())
+}
+
 func (ws *WSState) RunWSRead() {
 	shell := ws.GetShell()
 	if shell == nil {
 		return
 	}
-	shell.WriteJson(map[string]interface{}{"type": "hello"}) // let client know we accepted this connection, ignore error
+	shell.WriteJson(map[string]any{"type": "hello"}) // let client know we accepted this connection, ignore error
 	for msgBytes := range shell.ReadChan {
-		pk, err := packet.ParseJsonPacket(msgBytes)
+		err := ws.processMessage(msgBytes)
 		if err != nil {
-			log.Printf("error unmarshalling ws message: %v\n", err)
-			continue
+			// TODO send errors back to client? likely unrecoverable
+			log.Printf("[scws] %v\n", err)
 		}
-		if pk.GetType() == scpacket.WatchScreenPacketStr {
-			wsPk := pk.(*scpacket.WatchScreenPacketType)
-			err := ws.handleWatchScreen(wsPk)
-			if err != nil {
-				// TODO send errors back to client, likely unrecoverable
-				log.Printf("[ws %s] error %v\n", ws.ClientId, err)
-			}
-			continue
-		}
-		isAuth := ws.IsAuthenticated()
-		if !isAuth {
-			log.Printf("[error] cannot process ws-packet[%s], not authenticated\n", pk.GetType())
-			continue
-		}
-		if pk.GetType() == scpacket.FeInputPacketStr {
-			feInputPk := pk.(*scpacket.FeInputPacketType)
-			if feInputPk.Remote.OwnerId != "" {
-				log.Printf("[error] cannot send input to remote with ownerid\n")
-				continue
-			}
-			if feInputPk.Remote.RemoteId == "" {
-				log.Printf("[error] invalid input packet, remoteid is not set\n")
-				continue
-			}
-			err := RemoteInputMapQueue.Enqueue(feInputPk.Remote.RemoteId, func() {
-				err = sendCmdInput(feInputPk)
-				if err != nil {
-					log.Printf("[error] sending command input: %v\n", err)
-				}
-			})
-			if err != nil {
-				log.Printf("[error] could not queue sendCmdInput: %v\n", err)
-				continue
-			}
-			continue
-		}
-		if pk.GetType() == scpacket.RemoteInputPacketStr {
-			inputPk := pk.(*scpacket.RemoteInputPacketType)
-			if inputPk.RemoteId == "" {
-				log.Printf("[error] invalid remoteinput packet, remoteid is not set\n")
-				continue
-			}
-			go func() {
-				err = remote.SendRemoteInput(inputPk)
-				if err != nil {
-					log.Printf("[error] processing remote input: %v\n", err)
-				}
-			}()
-			continue
-		}
-		log.Printf("got ws bad message: %v\n", pk.GetType())
 	}
 }
 
@@ -288,33 +326,9 @@ func sendCmdInput(pk *scpacket.FeInputPacketType) error {
 	if pk.Remote.RemoteId == "" {
 		return fmt.Errorf("input must set remoteid")
 	}
-	msh := remote.GetRemoteById(pk.Remote.RemoteId)
-	if msh == nil {
+	wsh := remote.GetRemoteById(pk.Remote.RemoteId)
+	if wsh == nil {
 		return fmt.Errorf("remote %s not found", pk.Remote.RemoteId)
 	}
-	if len(pk.InputData64) > 0 {
-		inputLen := packet.B64DecodedLen(pk.InputData64)
-		if inputLen > MaxInputDataSize {
-			return fmt.Errorf("input data size too large, len=%d (max=%d)", inputLen, MaxInputDataSize)
-		}
-		dataPk := packet.MakeDataPacket()
-		dataPk.CK = pk.CK
-		dataPk.FdNum = 0 // stdin
-		dataPk.Data64 = pk.InputData64
-		err = msh.SendInput(dataPk)
-		if err != nil {
-			return err
-		}
-	}
-	if pk.SigName != "" || pk.WinSize != nil {
-		siPk := packet.MakeSpecialInputPacket()
-		siPk.CK = pk.CK
-		siPk.SigName = pk.SigName
-		siPk.WinSize = pk.WinSize
-		err = msh.SendSpecialInput(siPk)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return wsh.HandleFeInput(pk)
 }

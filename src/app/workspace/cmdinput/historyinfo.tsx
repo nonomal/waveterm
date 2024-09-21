@@ -7,12 +7,14 @@ import * as mobx from "mobx";
 import { sprintf } from "sprintf-js";
 import { boundMethod } from "autobind-decorator";
 import { If, For } from "tsx-control-statements/components";
-import cn from "classnames";
+import { clsx } from "clsx";
 import dayjs from "dayjs";
-import type { HistoryItem, HistoryQueryOpts } from "../../../types/types";
 import localizedFormat from "dayjs/plugin/localizedFormat";
-import { GlobalModel } from "../../../model/model";
-import { isBlank } from "../../../util/util";
+import { GlobalModel } from "@/models";
+import { isBlank } from "@/util/util";
+
+import "./historyinfo.less";
+import { AuxiliaryCmdView } from "./auxview";
 
 dayjs.extend(localizedFormat);
 
@@ -29,48 +31,27 @@ function truncateWithTDots(str: string, maxLen: number): string {
 }
 
 @mobxReact.observer
-class HistoryInfo extends React.Component<{}, {}> {
-    lastClickHNum: string = null;
-    lastClickTs: number = 0;
-    containingText: mobx.IObservableValue<string> = mobx.observable.box("");
-
-    componentDidMount() {
-        let inputModel = GlobalModel.inputModel;
-        let hitem = inputModel.getHistorySelectedItem();
-        if (hitem == null) {
-            hitem = inputModel.getFirstHistoryItem();
-        }
-        if (hitem != null) {
-            inputModel.scrollHistoryItemIntoView(hitem.historynum);
-        }
-    }
-
-    @boundMethod
-    handleItemClick(hitem: HistoryItem) {
-        let inputModel = GlobalModel.inputModel;
-        let selItem = inputModel.getHistorySelectedItem();
-        if (this.lastClickHNum == hitem.historynum && selItem != null && selItem.historynum == hitem.historynum) {
-            inputModel.grabSelectedHistoryItem();
-            return;
-        }
-        inputModel.giveFocus();
-        inputModel.setHistorySelectionNum(hitem.historynum);
-        let now = Date.now();
-        this.lastClickHNum = hitem.historynum;
-        this.lastClickTs = now;
-        setTimeout(() => {
-            if (this.lastClickTs == now) {
-                this.lastClickHNum = null;
-                this.lastClickTs = 0;
-            }
-        }, 3000);
+class HItem extends React.Component<
+    {
+        hitem: HistoryItem;
+        isSelected: boolean;
+        opts: HistoryQueryOpts;
+        snames: Record<string, string>;
+        scrNames: Record<string, string>;
+        onClick: (hitem: HistoryItem) => void;
+    },
+    {}
+> {
+    constructor(props) {
+        super(props);
+        mobx.makeObservable(this);
     }
 
     renderRemote(hitem: HistoryItem): any {
         if (hitem.remote == null || isBlank(hitem.remote.remoteid)) {
             return sprintf("%-15s ", "");
         }
-        let r = GlobalModel.getRemote(hitem.remote.remoteid);
+        const r = GlobalModel.getRemote(hitem.remote.remoteid);
         if (r == null) {
             return sprintf("%-15s ", "???");
         }
@@ -98,15 +79,15 @@ class HistoryInfo extends React.Component<{}, {}> {
         if (!opts.limitRemote) {
             remoteStr = this.renderRemote(hitem);
         }
-        let selectedStr = isSelected ? "*" : " ";
-        let lineNumStr = hitem.linenum > 0 ? "(" + hitem.linenum + ")" : "";
+        const selectedStr = isSelected ? "*" : " ";
+        const lineNumStr = hitem.linenum > 0 ? "(" + hitem.linenum + ")" : "";
         if (isBlank(opts.queryType) || opts.queryType == "screen") {
             return selectedStr + sprintf("%7s", lineNumStr) + " " + remoteStr;
         }
         if (opts.queryType == "session") {
             let screenStr = "";
             if (!isBlank(hitem.screenid)) {
-                let scrName = scrNames[hitem.screenid];
+                const scrName = scrNames[hitem.screenid];
                 if (scrName != null) {
                     screenStr = "[" + truncateWithTDots(scrName, 15) + "]";
                 }
@@ -116,19 +97,18 @@ class HistoryInfo extends React.Component<{}, {}> {
         if (opts.queryType == "global") {
             let sessionStr = "";
             if (!isBlank(hitem.sessionid)) {
-                let sessionName = snames[hitem.sessionid];
+                const sessionName = snames[hitem.sessionid];
                 if (sessionName != null) {
                     sessionStr = "#" + truncateWithTDots(sessionName, 15);
                 }
             }
             let screenStr = "";
             if (!isBlank(hitem.screenid)) {
-                let scrName = scrNames[hitem.screenid];
+                const scrName = scrNames[hitem.screenid];
                 if (scrName != null) {
                     screenStr = "[" + truncateWithTDots(scrName, 13) + "]";
                 }
             }
-            let ssStr = sessionStr + screenStr;
             return (
                 selectedStr +
                 sprintf("%15s ", sessionStr) +
@@ -142,28 +122,23 @@ class HistoryInfo extends React.Component<{}, {}> {
         return "-";
     }
 
-    renderHItem(
-        hitem: HistoryItem,
-        opts: HistoryQueryOpts,
-        isSelected: boolean,
-        snames: Record<string, string>,
-        scrNames: Record<string, string>
-    ): any {
-        let lines = hitem.cmdstr.split("\n");
+    render() {
+        const { hitem, isSelected, opts, snames, scrNames } = this.props;
+        const lines = hitem.cmdstr.split("\n");
         let line: string = "";
         let idx = 0;
-        let infoText = this.renderHInfoText(hitem, opts, isSelected, snames, scrNames);
-        let infoTextSpacer = sprintf("%" + infoText.length + "s", "");
+        const infoText = this.renderHInfoText(hitem, opts, isSelected, snames, scrNames);
+        const infoTextSpacer = sprintf("%" + infoText.length + "s", "");
         return (
             <div
                 key={hitem.historynum}
-                className={cn(
+                className={clsx(
                     "history-item",
                     { "is-selected": isSelected },
                     { "history-haderror": hitem.haderror },
                     "hnum-" + hitem.historynum
                 )}
-                onClick={() => this.handleItemClick(hitem)}
+                onClick={() => this.props.onClick(hitem)}
             >
                 <div className="history-line">
                     {infoText} {lines[0]}
@@ -176,20 +151,92 @@ class HistoryInfo extends React.Component<{}, {}> {
             </div>
         );
     }
+}
+
+@mobxReact.observer
+class HistoryInfo extends React.Component<{}, {}> {
+    lastClickHNum: string = null;
+    lastClickTs: number = 0;
+    containingText: mobx.IObservableValue<string> = mobx.observable.box("");
+
+    /**
+     * Handles the OverlayScrollbars initialization event to set the scroll position without it being overridden.
+     */
+    @boundMethod
+    handleScrollbarInitialized() {
+        const inputModel = GlobalModel.inputModel;
+        let hitem = inputModel.getHistorySelectedItem();
+        if (hitem == null) {
+            hitem = inputModel.getFirstHistoryItem();
+        }
+        if (hitem != null) {
+            inputModel.scrollHistoryItemIntoView(hitem.historynum);
+        }
+    }
+
+    @mobx.action.bound
+    handleClose() {
+        GlobalModel.inputModel.closeAuxView();
+    }
+
+    @mobx.action.bound
+    handleItemClick(hitem: HistoryItem) {
+        const inputModel = GlobalModel.inputModel;
+        const selItem = inputModel.getHistorySelectedItem();
+        inputModel.setAuxViewFocus(!inputModel.getAuxViewFocus());
+        if (this.lastClickHNum == hitem.historynum && selItem != null && selItem.historynum == hitem.historynum) {
+            inputModel.grabSelectedHistoryItem();
+            return;
+        }
+        inputModel.setHistorySelectionNum(hitem.historynum);
+        const now = Date.now();
+        this.lastClickHNum = hitem.historynum;
+        this.lastClickTs = now;
+        setTimeout(() => {
+            if (this.lastClickTs == now) {
+                this.lastClickHNum = null;
+                this.lastClickTs = 0;
+            }
+        }, 3000);
+    }
+
+    @mobx.action.bound
+    handleClickType() {
+        const inputModel = GlobalModel.inputModel;
+        inputModel.setAuxViewFocus(true);
+        inputModel.toggleHistoryType();
+    }
+
+    @mobx.action.bound
+    handleClickRemote() {
+        const inputModel = GlobalModel.inputModel;
+        inputModel.setAuxViewFocus(true);
+        inputModel.toggleRemoteType();
+    }
 
     @boundMethod
-    handleClose() {
-        GlobalModel.inputModel.toggleInfoMsg();
+    getTitleBarContents(): React.ReactElement[] {
+        const opts = GlobalModel.inputModel.historyQueryOpts.get();
+
+        return [
+            <div className="history-opt history-clickable-opt" key="screen" onClick={this.handleClickType}>
+                [for {opts.queryType} &#x2318;S]
+            </div>,
+            <div className="history-opt" key="query-str" title="type to search">
+                [containing '{opts.queryStr}']
+            </div>,
+            <div className="history-opt history-clickable-opt" key="remote" onClick={this.handleClickRemote}>
+                [{opts.limitRemote ? "this" : "any"} remote &#x2318;R]
+            </div>,
+        ];
     }
 
     render() {
-        let inputModel = GlobalModel.inputModel;
-        let idx: number = 0;
-        let selItem = inputModel.getHistorySelectedItem();
-        let hitems = inputModel.getFilteredHistoryItems();
-        hitems = hitems.slice().reverse();
+        const inputModel = GlobalModel.inputModel;
+        const selItem = inputModel.getHistorySelectedItem();
+        const hitems = inputModel.filteredHistoryItems;
+        const opts = inputModel.historyQueryOpts.get();
         let hitem: HistoryItem = null;
-        let opts = inputModel.historyQueryOpts.get();
         let snames: Record<string, string> = {};
         let scrNames: Record<string, string> = {};
         if (opts.queryType == "global") {
@@ -199,23 +246,17 @@ class HistoryInfo extends React.Component<{}, {}> {
             scrNames = GlobalModel.getScreenNames();
         }
         return (
-            <div className="cmd-history">
-                <div className="history-title">
-                    <div>history</div>
-                    <div className="spacer"></div>
-                    <div className="history-opt">[for {opts.queryType} &#x2318;S]</div>
-                    <div className="spacer"></div>
-                    <div className="history-opt">[containing '{opts.queryStr}']</div>
-                    <div className="spacer"></div>
-                    <div className="history-opt">[{opts.limitRemote ? "this" : "any"} remote &#x2318;R]</div>
-                    <div className="grow-spacer"></div>
-                    <div className="history-clickable-opt" onClick={this.handleClose}>
-                        (ESC)
-                    </div>
-                    <div className="spacer"></div>
-                </div>
+            <AuxiliaryCmdView
+                title="History"
+                className="cmd-history"
+                onClose={this.handleClose}
+                titleBarContents={this.getTitleBarContents()}
+                iconClass="fa-sharp fa-solid fa-clock-rotate-left"
+                scrollable={true}
+                onScrollbarInitialized={this.handleScrollbarInitialized}
+            >
                 <div
-                    className={cn(
+                    className={clsx(
                         "history-items",
                         { "show-remotes": !opts.limitRemote },
                         { "show-sessions": opts.queryType == "global" }
@@ -224,11 +265,19 @@ class HistoryInfo extends React.Component<{}, {}> {
                     <If condition={hitems.length == 0}>[no history]</If>
                     <If condition={hitems.length > 0}>
                         <For each="hitem" index="idx" of={hitems}>
-                            {this.renderHItem(hitem, opts, hitem == selItem, snames, scrNames)}
+                            <HItem
+                                key={hitem.historyid}
+                                hitem={hitem}
+                                isSelected={hitem == selItem}
+                                opts={opts}
+                                snames={snames}
+                                scrNames={scrNames}
+                                onClick={this.handleItemClick}
+                            ></HItem>
                         </For>
                     </If>
                 </div>
-            </div>
+            </AuxiliaryCmdView>
         );
     }
 }

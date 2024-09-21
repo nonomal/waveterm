@@ -6,15 +6,33 @@ import * as mobxReact from "mobx-react";
 import * as mobx from "mobx";
 import { boundMethod } from "autobind-decorator";
 import { If, For } from "tsx-control-statements/components";
-import cn from "classnames";
-import { GlobalModel, RemotesModel, GlobalCommandRunner } from "../../model/model";
-import { Button, IconButton, Status } from "../common/common";
-import * as T from "../../types/types";
-import * as util from "../../util/util";
+import { clsx } from "clsx";
+import { GlobalModel, RemotesModel, GlobalCommandRunner } from "@/models";
+import { Button, Status } from "@/common/elements";
+import * as util from "@/util/util";
 
 import "./connections.less";
+import { MainView } from "../common/elements/mainview";
+import { OverlayScrollbarsComponent } from "overlayscrollbars-react";
 
-type OV<V> = mobx.IObservableValue<V>;
+class ConnectionsKeybindings extends React.Component<{}, {}> {
+    componentDidMount() {
+        let connectionViewModel = GlobalModel.connectionViewModel;
+        let keybindManager = GlobalModel.keybindManager;
+        keybindManager.registerKeybinding("mainview", "connections", "generic:cancel", (waveEvent) => {
+            connectionViewModel.closeView();
+            return true;
+        });
+    }
+
+    componentWillUnmount() {
+        GlobalModel.keybindManager.unregisterDomain("connections");
+    }
+
+    render() {
+        return null;
+    }
+}
 
 @mobxReact.observer
 class ConnectionsView extends React.Component<{ model: RemotesModel }, { hoveredItemId: string }> {
@@ -53,14 +71,29 @@ class ConnectionsView extends React.Component<{ model: RemotesModel }, { hovered
     }
 
     @boundMethod
-    getName(item: T.RemoteType) {
+    getName(item: RemoteType) {
         const { remotealias, remotecanonicalname } = item;
         return remotealias ? `${remotealias} [${remotecanonicalname}]` : remotecanonicalname;
     }
 
     @boundMethod
+    getImportSymbol(item: RemoteType): React.ReactElement<any, any> {
+        const { sshconfigsrc } = item;
+        if (sshconfigsrc == "sshconfig-import") {
+            return <i title="Connection Imported from SSH Config" className="fa-sharp fa-solid fa-file-import" />;
+        } else {
+            return <></>;
+        }
+    }
+
+    @boundMethod
     handleAddConnection(): void {
         GlobalModel.remotesModel.openAddModal({ remoteedit: true });
+    }
+
+    @boundMethod
+    handleImportSshConfig(): void {
+        GlobalCommandRunner.importSshConfig();
     }
 
     @boundMethod
@@ -78,6 +111,11 @@ class ConnectionsView extends React.Component<{ model: RemotesModel }, { hovered
             default:
                 return "red";
         }
+    }
+
+    @boundMethod
+    handleClose() {
+        GlobalModel.connectionViewModel.closeView();
     }
 
     componentDidMount() {
@@ -105,70 +143,84 @@ class ConnectionsView extends React.Component<{ model: RemotesModel }, { hovered
         }
 
         let items = util.sortAndFilterRemotes(GlobalModel.remotes.slice());
-        let item: T.RemoteType = null;
+        let item: RemoteType = null;
 
         return (
-            <div className={cn("connections-view")}>
-                <header className="header">
-                    <div className="connections-title text-primary">Connections</div>
-                </header>
-                <table
-                    className="connections-table"
-                    cellSpacing="0"
-                    cellPadding="0"
-                    border={0}
-                    ref={this.tableRef}
-                    onMouseLeave={this.handleTableHoverLeave}
+            <MainView className="connections-view" title="Connections" onClose={this.handleClose}>
+                <If condition={!isHidden}>
+                    <ConnectionsKeybindings></ConnectionsKeybindings>
+                </If>
+                <OverlayScrollbarsComponent
+                    className="connections-table-container"
+                    options={{ scrollbars: { autoHide: "leave" } }}
+                    defer={true}
                 >
-                    <colgroup>
-                        <col className="first-col" />
-                        <col className="second-col" />
-                        <col className="third-col" />
-                    </colgroup>
-                    <thead>
-                        <tr>
-                            <th className="text-standard col-name">
-                                <div>Name</div>
-                            </th>
-                            <th className="text-standard col-type">
-                                <div>Type</div>
-                            </th>
-                            <th className="text-standard col-status">
-                                <div>Status</div>
-                            </th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <For index="idx" each="item" of={items}>
-                            <tr
-                                key={item.remoteid}
-                                className={cn("connections-item", {
-                                    hovered: this.state.hoveredItemId === item.remoteid,
-                                })}
-                                onClick={() => this.handleRead(item.remoteid)} // Moved onClick here
-                            >
-                                <td className="col-name">
-                                    <div>{this.getName(item)}</div>
-                                </td>
-                                <td className="col-type">
-                                    <div>{item.remotetype}</div>
-                                </td>
-                                <td className="col-status">
-                                    <div>
-                                        <Status status={this.getStatus(item.status)} text={item.status} />
-                                    </div>
-                                </td>
+                    <table
+                        className="connections-table"
+                        cellSpacing="0"
+                        cellPadding="0"
+                        border={0}
+                        ref={this.tableRef}
+                        onMouseLeave={this.handleTableHoverLeave}
+                    >
+                        <colgroup>
+                            <col className="first-col" />
+                            <col className="second-col" />
+                            <col className="third-col" />
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th className="text-standard col-name">
+                                    <div>Name</div>
+                                </th>
+                                <th className="text-standard col-type">
+                                    <div>Type</div>
+                                </th>
+                                <th className="text-standard col-status">
+                                    <div>Status</div>
+                                </th>
                             </tr>
-                        </For>
-                    </tbody>
-                </table>
+                        </thead>
+                        <tbody>
+                            <For index="idx" each="item" of={items}>
+                                <tr
+                                    key={item.remoteid}
+                                    className={clsx("connections-item", {
+                                        hovered: this.state.hoveredItemId === item.remoteid,
+                                    })}
+                                    onClick={() => this.handleRead(item.remoteid)} // Moved onClick here
+                                >
+                                    <td className="col-name">
+                                        <Status status={this.getStatus(item.status)} text=""></Status>
+                                        {this.getName(item)}&nbsp;{this.getImportSymbol(item)}
+                                    </td>
+                                    <td className="col-type">
+                                        <div>{item.remotetype}</div>
+                                    </td>
+                                    <td className="col-status">
+                                        <div>
+                                            <Status status={this.getStatus(item.status)} text={item.status} />
+                                        </div>
+                                    </td>
+                                </tr>
+                            </For>
+                        </tbody>
+                    </table>
+                </OverlayScrollbarsComponent>
                 <footer>
                     <Button
-                        theme="secondary"
+                        className="secondary"
                         leftIcon={<i className="fa-sharp fa-solid fa-plus"></i>}
                         onClick={this.handleAddConnection}
                     >
                         New Connection
+                    </Button>
+                    <Button
+                        className="secondary"
+                        leftIcon={<i className="fa-sharp fa-solid fa-fw fa-file-import"></i>}
+                        onClick={this.handleImportSshConfig}
+                    >
+                        Import Config
                     </Button>
                 </footer>
                 <If condition={items.length == 0}>
@@ -176,7 +228,7 @@ class ConnectionsView extends React.Component<{ model: RemotesModel }, { hovered
                         <div>No Connections Items Found</div>
                     </div>
                 </If>
-            </div>
+            </MainView>
         );
     }
 }

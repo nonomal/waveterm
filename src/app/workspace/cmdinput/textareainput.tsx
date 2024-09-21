@@ -4,11 +4,16 @@
 import * as React from "react";
 import * as mobxReact from "mobx-react";
 import * as mobx from "mobx";
+import * as util from "@/util/util";
+import { If } from "tsx-control-statements/components";
 import { boundMethod } from "autobind-decorator";
-import cn from "classnames";
-import { GlobalModel, GlobalCommandRunner } from "../../../model/model";
-import { getMonoFontSize } from "../../../util/textmeasure";
-import { isModKeyPress, hasNoModifiers } from "../../../util/util";
+import { clsx } from "clsx";
+import { GlobalModel, GlobalCommandRunner, Screen } from "@/models";
+import { getMonoFontSize } from "@/util/textmeasure";
+import * as appconst from "@/app/appconst";
+
+type OV<T> = mobx.IObservableValue<T>;
+const MaxInputLength = 10 * 1024;
 
 function pageSize(div: any): number {
     if (div == null) {
@@ -34,53 +39,292 @@ function scrollDiv(div: any, amt: number) {
     div.scrollTo({ top: newScrollTop, behavior: "smooth" });
 }
 
+class HistoryKeybindings extends React.Component<{}, {}> {
+    componentDidMount(): void {
+        if (GlobalModel.activeMainView != "session") {
+            return;
+        }
+        const inputModel = GlobalModel.inputModel;
+        const keybindManager = GlobalModel.keybindManager;
+        keybindManager.registerKeybinding("pane", "history", "generic:cancel", (waveEvent) => {
+            inputModel.resetHistory();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "generic:confirm", (waveEvent) => {
+            inputModel.grabSelectedHistoryItem();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "history:closeHistory", (waveEvent) => {
+            inputModel.resetInput();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "history:toggleShowRemotes", (waveEvent) => {
+            inputModel.toggleRemoteType();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "history:changeScope", (waveEvent) => {
+            inputModel.toggleHistoryType();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "generic:selectAbove", (waveEvent) => {
+            inputModel.moveHistorySelection(1);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "generic:selectBelow", (waveEvent) => {
+            inputModel.moveHistorySelection(-1);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "generic:selectPageAbove", (waveEvent) => {
+            inputModel.moveHistorySelection(10);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "generic:selectPageBelow", (waveEvent) => {
+            inputModel.moveHistorySelection(-10);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "history:selectPreviousItem", (waveEvent) => {
+            inputModel.moveHistorySelection(1);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "history", "history:selectNextItem", (waveEvent) => {
+            inputModel.moveHistorySelection(-1);
+            return true;
+        });
+    }
+
+    componentWillUnmount(): void {
+        GlobalModel.keybindManager.unregisterDomain("history");
+    }
+
+    render() {
+        return null;
+    }
+}
+
+class CmdInputKeybindings extends React.Component<{ inputObject: TextAreaInput }, {}> {
+    curPress: string;
+    lastTab: boolean;
+
+    componentDidMount() {
+        if (GlobalModel.activeMainView != "session") {
+            return;
+        }
+        const inputObject = this.props.inputObject;
+        const keybindManager = GlobalModel.keybindManager;
+        const inputModel = GlobalModel.inputModel;
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:autocomplete", (waveEvent) => {
+            this.curPress = "tab";
+            // For now, we want to preserve the old behavior if autocomplete is disabled
+            if (GlobalModel.autocompleteModel.isEnabled) {
+                if (this.lastTab) {
+                    const curLine = inputModel.curLine;
+                    if (curLine != "") {
+                        inputModel.setActiveAuxView(appconst.InputAuxView_Suggestions);
+                    }
+                } else {
+                    this.lastTab = true;
+                }
+            } else {
+                const lastTab = this.lastTab;
+                this.lastTab = true;
+                this.curPress = "tab";
+                const curLine = inputModel.curLine;
+                if (lastTab) {
+                    GlobalModel.submitCommand(
+                        "_compgen",
+                        null,
+                        [curLine],
+                        { comppos: String(curLine.length), compshow: "1", nohist: "1" },
+                        true
+                    );
+                } else {
+                    GlobalModel.submitCommand(
+                        "_compgen",
+                        null,
+                        [curLine],
+                        { comppos: String(curLine.length), nohist: "1" },
+                        true
+                    );
+                }
+                return true;
+            }
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:confirm", (waveEvent) => {
+            GlobalModel.closeTabSettings();
+            if (GlobalModel.inputModel.isEmpty()) {
+                const activeWindow = GlobalModel.getScreenLinesForActiveScreen();
+                const activeScreen = GlobalModel.getActiveScreen();
+                if (activeScreen != null && activeWindow != null && activeWindow.lines.length > 0) {
+                    activeScreen.setSelectedLine(0);
+                    GlobalCommandRunner.screenSelectLine("E");
+                }
+            } else {
+                setTimeout(() => GlobalModel.inputModel.uiSubmitCommand(), 0);
+            }
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:cancel", (waveEvent) => {
+            GlobalModel.closeTabSettings();
+            inputModel.closeAuxView();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:expandInput", (waveEvent) => {
+            inputModel.toggleExpandInput();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:clearInput", (waveEvent) => {
+            inputModel.resetInput();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:cutLineLeftOfCursor", (waveEvent) => {
+            inputObject.controlU();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:cutWordLeftOfCursor", (waveEvent) => {
+            inputObject.controlW();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:paste", (waveEvent) => {
+            inputObject.controlY();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:openHistory", (waveEvent) => {
+            inputModel.openHistory();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:previousHistoryItem", (waveEvent) => {
+            this.curPress = "historyupdown";
+            inputObject.controlP();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:nextHistoryItem", (waveEvent) => {
+            this.curPress = "historyupdown";
+            inputObject.controlN();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "cmdinput:openAIChat", (waveEvent) => {
+            inputModel.openAIAssistantChat();
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:selectAbove", (waveEvent) => {
+            this.curPress = "historyupdown";
+            const rtn = inputObject.arrowUpPressed();
+            return rtn;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:selectBelow", (waveEvent) => {
+            this.curPress = "historyupdown";
+            const rtn = inputObject.arrowDownPressed();
+            return rtn;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:selectRight", (waveEvent) => {
+            return inputObject.arrowRightPressed();
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:selectPageAbove", (waveEvent) => {
+            this.curPress = "historyupdown";
+            inputObject.scrollPage(true);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:selectPageBelow", (waveEvent) => {
+            this.curPress = "historyupdown";
+            inputObject.scrollPage(false);
+            return true;
+        });
+        keybindManager.registerKeybinding("pane", "cmdinput", "generic:expandTextInput", (waveEvent) => {
+            inputObject.modEnter();
+            return true;
+        });
+        keybindManager.registerDomainCallback("cmdinput", (waveEvent) => {
+            if (this.curPress != "tab") {
+                this.lastTab = false;
+            }
+            if (this.curPress != "historyupdown") {
+                inputObject.lastHistoryUpDown = false;
+            }
+            this.curPress = "";
+            return false;
+        });
+    }
+
+    componentWillUnmount() {
+        GlobalModel.keybindManager.unregisterDomain("cmdinput");
+    }
+
+    render() {
+        return null;
+    }
+}
+
 @mobxReact.observer
-class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> {
-    lastTab: boolean = false;
+class TextAreaInput extends React.Component<{ screen: Screen; onHeightChange: () => void }, {}> {
     lastHistoryUpDown: boolean = false;
-    lastTabCurLine: mobx.IObservableValue<string> = mobx.observable.box(null);
     lastFocusType: string = null;
-    mainInputRef: React.RefObject<any>;
-    historyInputRef: React.RefObject<any>;
-    controlRef: React.RefObject<any>;
+    mainInputRef: React.RefObject<HTMLTextAreaElement> = React.createRef();
+    historyInputRef: React.RefObject<HTMLInputElement> = React.createRef();
+    controlRef: React.RefObject<HTMLDivElement> = React.createRef();
     lastHeight: number = 0;
+    lastSP: StrWithPos = { str: "", pos: appconst.NoStrPos };
+    version: OV<number> = mobx.observable.box(0, { name: "textAreaInput-version" }); // forces render updates
 
     constructor(props) {
         super(props);
-        this.mainInputRef = React.createRef();
-        this.historyInputRef = React.createRef();
-        this.controlRef = React.createRef();
+        mobx.makeObservable(this);
     }
 
-    setFocus(): void {
-        let inputModel = GlobalModel.inputModel;
-        if (inputModel.historyShow.get()) {
-            this.historyInputRef.current.focus();
-        } else {
-            this.mainInputRef.current.focus();
+    @mobx.action.bound
+    incVersion(): void {
+        const v = this.version.get();
+        this.version.set(v + 1);
+    }
+
+    getCurSP(): StrWithPos {
+        const textarea = this.mainInputRef.current;
+        if (textarea == null) {
+            return this.lastSP;
         }
+        const str = textarea.value;
+        const pos = textarea.selectionStart;
+        const endPos = textarea.selectionEnd;
+        if (pos != endPos) {
+            return { str, pos: appconst.NoStrPos };
+        }
+        return { str, pos };
+    }
+
+    updateSP(): void {
+        const curSP = this.getCurSP();
+        if (curSP.str == this.lastSP.str && curSP.pos == this.lastSP.pos) {
+            return;
+        }
+        this.lastSP = curSP;
+        GlobalModel.sendCmdInputText(this.props.screen.screenId, curSP);
+    }
+
+    @mobx.action
+    setFocus(): void {
+        GlobalModel.inputModel.giveFocus();
     }
 
     getTextAreaMaxCols(): number {
-        let taElem = this.mainInputRef.current;
+        const taElem = this.mainInputRef.current;
         if (taElem == null) {
             return 0;
         }
-        let cs = window.getComputedStyle(taElem);
-        let padding = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
-        let borders = parseFloat(cs.borderLeft) + parseFloat(cs.borderRight);
-        let contentWidth = taElem.clientWidth - padding - borders;
-        let fontSize = getMonoFontSize(parseInt(cs.fontSize));
-        let maxCols = Math.floor(contentWidth / Math.ceil(fontSize.width));
+        const cs = window.getComputedStyle(taElem);
+        const padding = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+        const borders = parseFloat(cs.borderLeft) + parseFloat(cs.borderRight);
+        const contentWidth = taElem.clientWidth - padding - borders;
+        const fontSize = getMonoFontSize(parseInt(cs.fontSize));
+        const maxCols = Math.floor(contentWidth / Math.ceil(fontSize.width));
         return maxCols;
     }
 
     checkHeight(shouldFire: boolean): void {
-        let elem = this.controlRef.current;
+        const elem = this.controlRef.current;
         if (elem == null) {
             return;
         }
-        let curHeight = elem.offsetHeight;
+        const curHeight = elem.offsetHeight;
         if (this.lastHeight == curHeight) {
             return;
         }
@@ -90,310 +334,172 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
         }
     }
 
-    componentDidMount() {
-        let activeScreen = GlobalModel.getActiveScreen();
+    @mobx.action.bound
+    handleComponentDidMount() {
+        const activeScreen = GlobalModel.getActiveScreen();
         if (activeScreen != null) {
-            let focusType = activeScreen.focusType.get();
+            const focusType = activeScreen.focusType.get();
             if (focusType == "input") {
                 this.setFocus();
             }
             this.lastFocusType = focusType;
         }
         this.checkHeight(false);
+        this.updateSP();
     }
 
+    componentDidMount() {
+        this.handleComponentDidMount();
+        this.updateCursorPosIfForced();
+    }
+
+    updateCursorPosIfForced() {
+        const inputModel = GlobalModel.inputModel;
+        const fcpos = inputModel.forceCursorPos.get();
+        if (fcpos != null && fcpos != appconst.NoStrPos) {
+            if (this.mainInputRef.current != null) {
+                this.mainInputRef.current.selectionStart = fcpos;
+                this.mainInputRef.current.selectionEnd = fcpos;
+            }
+            inputModel.forceCursorPos.set(null);
+        }
+    }
+
+    @mobx.action
     componentDidUpdate() {
-        let activeScreen = GlobalModel.getActiveScreen();
+        const activeScreen = GlobalModel.getActiveScreen();
         if (activeScreen != null) {
-            let focusType = activeScreen.focusType.get();
+            const focusType = activeScreen.focusType.get();
             if (this.lastFocusType != focusType && focusType == "input") {
                 this.setFocus();
             }
             this.lastFocusType = focusType;
         }
-        let inputModel = GlobalModel.inputModel;
-        if (inputModel.forceCursorPos.get() != null) {
-            if (this.mainInputRef.current != null) {
-                this.mainInputRef.current.selectionStart = inputModel.forceCursorPos.get();
-                this.mainInputRef.current.selectionEnd = inputModel.forceCursorPos.get();
-            }
-            mobx.action(() => inputModel.forceCursorPos.set(null))();
-        }
+        const inputModel = GlobalModel.inputModel;
+        this.updateCursorPosIfForced();
         if (inputModel.forceInputFocus) {
             inputModel.forceInputFocus = false;
             this.setFocus();
         }
         this.checkHeight(true);
+        this.updateSP();
     }
 
     getLinePos(elem: any): { numLines: number; linePos: number } {
-        let numLines = elem.value.split("\n").length;
-        let linePos = elem.value.substr(0, elem.selectionStart).split("\n").length;
+        const numLines = elem.value.split("\n").length;
+        const linePos = elem.value.substr(0, elem.selectionStart).split("\n").length;
         return { numLines, linePos };
     }
 
-    @mobx.action
-    @boundMethod
-    onKeyDown(e: any) {
-        mobx.action(() => {
-            if (isModKeyPress(e)) {
-                return;
-            }
-            let model = GlobalModel;
-            let inputModel = model.inputModel;
-            let win = model.getScreenLinesForActiveScreen();
-            let ctrlMod = e.getModifierState("Control") || e.getModifierState("Meta") || e.getModifierState("Shift");
-            let curLine = inputModel.getCurLine();
+    arrowUpPressed(): boolean {
+        console.log("arrowUpPressed");
+        const inputModel = GlobalModel.inputModel;
+        if (!inputModel.isHistoryLoaded()) {
+            this.lastHistoryUpDown = true;
+            inputModel.loadHistory(false, 1, "screen");
+            return true;
+        }
+        const currentRef = this.mainInputRef.current;
+        if (currentRef == null) {
+            return true;
+        }
+        const linePos = this.getLinePos(currentRef);
+        const lastHist = this.lastHistoryUpDown;
+        if (!lastHist && linePos.linePos > 1) {
+            // regular arrow
+            return false;
+        }
+        inputModel.moveHistorySelection(1);
+        this.lastHistoryUpDown = true;
+        return true;
+    }
 
-            let lastTab = this.lastTab;
-            this.lastTab = e.code == "Tab";
-            let lastHist = this.lastHistoryUpDown;
-            this.lastHistoryUpDown = false;
-
-            if (e.code == "Tab") {
-                e.preventDefault();
-                if (lastTab) {
-                    GlobalModel.submitCommand(
-                        "_compgen",
-                        null,
-                        [curLine],
-                        { comppos: String(curLine.length), compshow: "1", nohist: "1" },
-                        true
-                    );
-                    return;
-                } else {
-                    GlobalModel.submitCommand(
-                        "_compgen",
-                        null,
-                        [curLine],
-                        { comppos: String(curLine.length), nohist: "1" },
-                        true
-                    );
-                    return;
-                }
-            }
-            if (e.code == "Enter") {
-                e.preventDefault();
-                if (!ctrlMod) {
-                    if (GlobalModel.inputModel.isEmpty()) {
-                        let activeWindow = GlobalModel.getScreenLinesForActiveScreen();
-                        let activeScreen = GlobalModel.getActiveScreen();
-                        if (activeScreen != null && activeWindow != null && activeWindow.lines.length > 0) {
-                            activeScreen.setSelectedLine(0);
-                            GlobalCommandRunner.screenSelectLine("E");
-                        }
-                        return;
-                    } else {
-                        setTimeout(() => GlobalModel.inputModel.uiSubmitCommand(), 0);
-                        return;
-                    }
-                }
-                e.target.setRangeText("\n", e.target.selectionStart, e.target.selectionEnd, "end");
-                GlobalModel.inputModel.setCurLine(e.target.value);
-                return;
-            }
-            if (e.code == "Escape") {
-                e.preventDefault();
-                e.stopPropagation();
-                let inputModel = GlobalModel.inputModel;
-                inputModel.toggleInfoMsg();
-                if (inputModel.inputMode.get() != null) {
-                    inputModel.resetInputMode();
-                }
-                return;
-            }
-            if (e.code == "KeyE" && e.getModifierState("Meta")) {
-                e.preventDefault();
-                e.stopPropagation();
-                let inputModel = GlobalModel.inputModel;
-                inputModel.toggleExpandInput();
-            }
-            if (e.code == "KeyC" && e.getModifierState("Control")) {
-                e.preventDefault();
-                inputModel.resetInput();
-                return;
-            }
-            if (e.code == "KeyU" && e.getModifierState("Control")) {
-                e.preventDefault();
-                this.controlU();
-                return;
-            }
-            if (e.code == "KeyP" && e.getModifierState("Control")) {
-                e.preventDefault();
-                this.controlP();
-                return;
-            }
-            if (e.code == "KeyN" && e.getModifierState("Control")) {
-                e.preventDefault();
-                this.controlN();
-                return;
-            }
-            if (e.code == "KeyW" && e.getModifierState("Control")) {
-                e.preventDefault();
-                this.controlW();
-                return;
-            }
-            if (e.code == "KeyY" && e.getModifierState("Control")) {
-                e.preventDefault();
-                this.controlY();
-                return;
-            }
-            if (e.code == "KeyR" && e.getModifierState("Control")) {
-                e.preventDefault();
-                inputModel.openHistory();
-                return;
-            }
-            if ((e.code == "ArrowUp" || e.code == "ArrowDown") && hasNoModifiers(e)) {
-                if (!inputModel.isHistoryLoaded()) {
-                    if (e.code == "ArrowUp") {
-                        this.lastHistoryUpDown = true;
-                        inputModel.loadHistory(false, 1, "screen");
-                    }
-                    return;
-                }
-                // invisible history movement
-                let linePos = this.getLinePos(e.target);
-                if (e.code == "ArrowUp") {
-                    if (!lastHist && linePos.linePos > 1) {
-                        // regular arrow
-                        return;
-                    }
-                    e.preventDefault();
-                    inputModel.moveHistorySelection(1);
-                    this.lastHistoryUpDown = true;
-                    return;
-                }
-                if (e.code == "ArrowDown") {
-                    if (!lastHist && linePos.linePos < linePos.numLines) {
-                        // regular arrow
-                        return;
-                    }
-                    e.preventDefault();
-                    inputModel.moveHistorySelection(-1);
-                    this.lastHistoryUpDown = true;
-                    return;
-                }
-            }
-            if (e.code == "PageUp" || e.code == "PageDown") {
-                e.preventDefault();
-                let infoScroll = inputModel.hasScrollingInfoMsg();
-                if (infoScroll) {
-                    let div = document.querySelector(".cmd-input-info");
-                    let amt = pageSize(div);
-                    scrollDiv(div, e.code == "PageUp" ? -amt : amt);
-                }
-            }
-            // console.log(e.code, e.keyCode, e.key, event.which, ctrlMod, e);
-        })();
+    arrowDownPressed(): boolean {
+        const inputModel = GlobalModel.inputModel;
+        if (!inputModel.isHistoryLoaded()) {
+            return true;
+        }
+        const currentRef = this.mainInputRef.current;
+        if (currentRef == null) {
+            return true;
+        }
+        const linePos = this.getLinePos(currentRef);
+        const lastHist = this.lastHistoryUpDown;
+        if (!lastHist && linePos.linePos < linePos.numLines) {
+            // regular arrow
+            return false;
+        }
+        inputModel.moveHistorySelection(-1);
+        this.lastHistoryUpDown = true;
+        return true;
     }
 
     @boundMethod
+    arrowRightPressed(): boolean {
+        // If the cursor is at the end of the line, apply the primary suggestion
+        const curSP = this.getCurSP();
+        if (curSP.pos < curSP.str.length) {
+            return false;
+        }
+        GlobalModel.autocompleteModel.applyPrimarySuggestion();
+        return true;
+    }
+
+    scrollPage(up: boolean) {
+        const inputModel = GlobalModel.inputModel;
+        const infoScroll = inputModel.hasScrollingInfoMsg();
+        if (infoScroll) {
+            const div = document.querySelector(".cmd-input-info");
+            const amt = pageSize(div);
+            scrollDiv(div, up ? -amt : amt);
+        }
+    }
+
+    modEnter() {
+        const currentRef = this.mainInputRef.current;
+        if (currentRef == null) {
+            return;
+        }
+        currentRef.setRangeText("\n", currentRef.selectionStart, currentRef.selectionEnd, "end");
+        GlobalModel.inputModel.curLine = currentRef.value;
+    }
+
+    @boundMethod
+    onKeyDown(e: any) {}
+
+    @mobx.action.bound
     onChange(e: any) {
-        mobx.action(() => {
-            GlobalModel.inputModel.setCurLine(e.target.value);
-        })();
+        GlobalModel.inputModel.curLine = e.target.value;
     }
 
     @boundMethod
-    onHistoryKeyDown(e: any) {
-        let inputModel = GlobalModel.inputModel;
-        if (e.code == "Escape") {
-            e.preventDefault();
-            inputModel.resetHistory();
-            return;
-        }
-        if (e.code == "Enter") {
-            e.preventDefault();
-            inputModel.grabSelectedHistoryItem();
-            return;
-        }
-        if (e.code == "KeyG" && e.getModifierState("Control")) {
-            e.preventDefault();
-            inputModel.resetInput();
-            return;
-        }
-        if (e.code == "KeyC" && e.getModifierState("Control")) {
-            e.preventDefault();
-            inputModel.resetInput();
-            return;
-        }
-        if (
-            e.code == "KeyR" &&
-            (e.getModifierState("Meta") || e.getModifierState("Control")) &&
-            !e.getModifierState("Shift")
-        ) {
-            e.preventDefault();
-            let opts = mobx.toJS(inputModel.historyQueryOpts.get());
-            if (opts.limitRemote) {
-                opts.limitRemote = false;
-                opts.limitRemoteInstance = false;
-            } else {
-                opts.limitRemote = true;
-                opts.limitRemoteInstance = true;
-            }
-            inputModel.setHistoryQueryOpts(opts);
-            return;
-        }
-        if (e.code == "KeyS" && (e.getModifierState("Meta") || e.getModifierState("Control"))) {
-            e.preventDefault();
-            let opts = mobx.toJS(inputModel.historyQueryOpts.get());
-            let htype = opts.queryType;
-            if (htype == "screen") {
-                htype = "session";
-            } else if (htype == "session") {
-                htype = "global";
-            } else {
-                htype = "screen";
-            }
-            inputModel.setHistoryType(htype);
-            return;
-        }
-        if (e.code == "Tab") {
-            e.preventDefault();
-            return;
-        }
-        if (e.code == "ArrowUp" || e.code == "ArrowDown") {
-            e.preventDefault();
-            inputModel.moveHistorySelection(e.code == "ArrowUp" ? 1 : -1);
-            return;
-        }
-        if (e.code == "PageUp" || e.code == "PageDown") {
-            e.preventDefault();
-            inputModel.moveHistorySelection(e.code == "PageUp" ? 10 : -10);
-            return;
-        }
-        if (e.code == "KeyP" && e.getModifierState("Control")) {
-            e.preventDefault();
-            inputModel.moveHistorySelection(1);
-            return;
-        }
-        if (e.code == "KeyN" && e.getModifierState("Control")) {
-            e.preventDefault();
-            inputModel.moveHistorySelection(-1);
-            return;
-        }
+    onSelect(e: any) {
+        this.incVersion();
     }
+
+    @boundMethod
+    onHistoryKeyDown(e: any) {}
 
     @boundMethod
     controlU() {
         if (this.mainInputRef.current == null) {
             return;
         }
-        let selStart = this.mainInputRef.current.selectionStart;
-        let value = this.mainInputRef.current.value;
+        const selStart = this.mainInputRef.current.selectionStart;
+        const value = this.mainInputRef.current.value;
         if (selStart > value.length) {
             return;
         }
-        let cutValue = value.substr(0, selStart);
-        let restValue = value.substr(selStart);
-        let cmdLineUpdate = { cmdline: restValue, cursorpos: 0 };
+        const cutValue = value.substring(0, selStart);
+        const restValue = value.substring(selStart);
+        const cmdLineUpdate = { str: restValue, pos: 0 };
         navigator.clipboard.writeText(cutValue);
         GlobalModel.inputModel.updateCmdLine(cmdLineUpdate);
     }
 
-    @boundMethod
+    @mobx.action.bound
     controlP() {
-        let inputModel = GlobalModel.inputModel;
+        const inputModel = GlobalModel.inputModel;
         if (!inputModel.isHistoryLoaded()) {
             this.lastHistoryUpDown = true;
             inputModel.loadHistory(false, 1, "screen");
@@ -403,9 +509,9 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
         this.lastHistoryUpDown = true;
     }
 
-    @boundMethod
+    @mobx.action.bound
     controlN() {
-        let inputModel = GlobalModel.inputModel;
+        const inputModel = GlobalModel.inputModel;
         inputModel.moveHistorySelection(-1);
         this.lastHistoryUpDown = true;
     }
@@ -415,15 +521,15 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
         if (this.mainInputRef.current == null) {
             return;
         }
-        let selStart = this.mainInputRef.current.selectionStart;
-        let value = this.mainInputRef.current.value;
+        const selStart = this.mainInputRef.current.selectionStart;
+        const value = this.mainInputRef.current.value;
         if (selStart > value.length) {
             return;
         }
         let cutSpot = selStart - 1;
         let initial = true;
         for (; cutSpot >= 0; cutSpot--) {
-            let ch = value[cutSpot];
+            const ch = value[cutSpot];
             if (ch == " " && initial) {
                 continue;
             }
@@ -436,10 +542,10 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
         if (cutSpot == -1) {
             cutSpot = 0;
         }
-        let cutValue = value.slice(cutSpot, selStart);
-        let prevValue = value.slice(0, cutSpot);
-        let restValue = value.slice(selStart);
-        let cmdLineUpdate = { cmdline: prevValue + restValue, cursorpos: prevValue.length };
+        const cutValue = value.slice(cutSpot, selStart);
+        const prevValue = value.slice(0, cutSpot);
+        const restValue = value.slice(selStart);
+        const cmdLineUpdate = { str: prevValue + restValue, pos: prevValue.length };
         navigator.clipboard.writeText(cutValue);
         GlobalModel.inputModel.updateCmdLine(cmdLineUpdate);
     }
@@ -449,42 +555,33 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
         if (this.mainInputRef.current == null) {
             return;
         }
-        let pastePromise = navigator.clipboard.readText();
+        const pastePromise = navigator.clipboard.readText();
         pastePromise.then((clipText) => {
             clipText = clipText ?? "";
-            let selStart = this.mainInputRef.current.selectionStart;
-            let selEnd = this.mainInputRef.current.selectionEnd;
-            let value = this.mainInputRef.current.value;
+            const selStart = this.mainInputRef.current.selectionStart;
+            const selEnd = this.mainInputRef.current.selectionEnd;
+            const value = this.mainInputRef.current.value;
             if (selStart > value.length || selEnd > value.length) {
                 return;
             }
-            let newValue = value.substr(0, selStart) + clipText + value.substr(selEnd);
-            let cmdLineUpdate = { cmdline: newValue, cursorpos: selStart + clipText.length };
+            const newValue = value.substring(0, selStart) + clipText + value.substring(selEnd);
+            const cmdLineUpdate = { str: newValue, pos: selStart + clipText.length };
             GlobalModel.inputModel.updateCmdLine(cmdLineUpdate);
         });
     }
 
-    @boundMethod
+    @mobx.action.bound
     handleHistoryInput(e: any) {
-        let inputModel = GlobalModel.inputModel;
-        mobx.action(() => {
-            let opts = mobx.toJS(inputModel.historyQueryOpts.get());
-            opts.queryStr = e.target.value;
-            inputModel.setHistoryQueryOpts(opts);
-        })();
+        const inputModel = GlobalModel.inputModel;
+        const opts = mobx.toJS(inputModel.historyQueryOpts.get());
+        opts.queryStr = e.target.value;
+        inputModel.setHistoryQueryOpts(opts);
     }
 
-    @boundMethod
-    handleMainFocus(e: any) {
-        let inputModel = GlobalModel.inputModel;
-        if (inputModel.historyShow.get()) {
-            e.preventDefault();
-            if (this.historyInputRef.current != null) {
-                this.historyInputRef.current.focus();
-            }
-            return;
-        }
-        inputModel.setPhysicalInputFocused(true);
+    @mobx.action.bound
+    handleFocus(e: any) {
+        e.preventDefault();
+        GlobalModel.inputModel.giveFocus();
     }
 
     @boundMethod
@@ -496,19 +593,6 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
     }
 
     @boundMethod
-    handleHistoryFocus(e: any) {
-        let inputModel = GlobalModel.inputModel;
-        if (!inputModel.historyShow.get()) {
-            e.preventDefault();
-            if (this.mainInputRef.current != null) {
-                this.mainInputRef.current.focus();
-            }
-            return;
-        }
-        inputModel.setPhysicalInputFocused(true);
-    }
-
-    @boundMethod
     handleHistoryBlur(e: any) {
         if (document.activeElement == this.historyInputRef.current) {
             return;
@@ -517,13 +601,12 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
     }
 
     render() {
-        let model = GlobalModel;
-        let inputModel = model.inputModel;
-        let curLine = inputModel.getCurLine();
-        let fcp = inputModel.forceCursorPos.get(); // for reaction
+        const model = GlobalModel;
+        const inputModel = model.inputModel;
+        const curLine = inputModel.curLine;
         let displayLines = 1;
-        let numLines = curLine.split("\n").length;
-        let maxCols = this.getTextAreaMaxCols();
+        const numLines = curLine.split("\n").length;
+        const maxCols = this.getTextAreaMaxCols();
         let longLine = false;
         if (maxCols != 0 && curLine.length >= maxCols - 4) {
             longLine = true;
@@ -531,21 +614,69 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
         if (numLines > 1 || longLine || inputModel.inputExpanded.get()) {
             displayLines = 5;
         }
-        let disabled = inputModel.historyShow.get();
-        if (disabled) {
+
+        const auxViewFocused = inputModel.getAuxViewFocus();
+        if (auxViewFocused) {
             displayLines = 1;
         }
-        let activeScreen = GlobalModel.getActiveScreen();
+        const activeScreen = GlobalModel.getActiveScreen();
         if (activeScreen != null) {
             activeScreen.focusType.get(); // for reaction
         }
-        let termFontSize = 14;
-        // fontSize*1.5 (line-height) + 2 * 0.5em padding
-        let computedInnerHeight = displayLines * (termFontSize * 1.5) + 2 * 0.5 * termFontSize;
-        // inner height + 2*1em padding
-        let computedOuterHeight = computedInnerHeight + 2 * 1.0 * termFontSize;
+        const termFontSize = GlobalModel.getTermFontSize();
+        const fontSize = getMonoFontSize(termFontSize);
+        const termPad = fontSize.pad;
+        const computedInnerHeight = displayLines * fontSize.height + 2 * termPad;
+        const computedOuterHeight = computedInnerHeight + 2 * termPad;
+        let shellType: string = "";
+        const screen = GlobalModel.getActiveScreen();
+        if (screen != null) {
+            const ri = screen.getCurRemoteInstance();
+            if (ri?.shelltype != null) {
+                shellType = ri.shelltype;
+            }
+            if (shellType == "") {
+                const rptr = screen.curRemote.get();
+                if (rptr != null) {
+                    const remote = GlobalModel.getRemote(rptr.remoteid);
+                    if (remote != null) {
+                        shellType = remote.defaultshelltype;
+                    }
+                }
+            }
+        }
+        const renderCmdInputKeybindings =
+            inputModel.shouldRenderAuxViewKeybindings(null) ||
+            inputModel.shouldRenderAuxViewKeybindings(appconst.InputAuxView_Info);
+        const renderHistoryKeybindings = inputModel.shouldRenderAuxViewKeybindings(appconst.InputAuxView_History);
+
+        // Will be null if the feature is disabled
+        const primaryAutocompleteSuggestion = GlobalModel.autocompleteModel.getPrimarySuggestionCompletion();
+
         return (
-            <div className="control is-expanded" ref={this.controlRef} style={{ height: computedOuterHeight }}>
+            <div
+                className="textareainput-div control is-expanded"
+                ref={this.controlRef}
+                style={{ height: computedOuterHeight }}
+            >
+                <If condition={renderCmdInputKeybindings}>
+                    <CmdInputKeybindings inputObject={this} />
+                </If>
+                <If condition={renderHistoryKeybindings}>
+                    <HistoryKeybindings />
+                </If>
+
+                <If condition={!util.isBlank(shellType)}>
+                    <div className="shelltag">{shellType}</div>
+                </If>
+                <If condition={primaryAutocompleteSuggestion}>
+                    <div
+                        className="textarea-ghost"
+                        style={{ height: computedInnerHeight, minHeight: computedInnerHeight, fontSize: termFontSize }}
+                    >
+                        {`${"\xa0".repeat(curLine.length)}${primaryAutocompleteSuggestion}`}
+                    </div>
+                </If>
                 <textarea
                     key="main"
                     ref={this.mainInputRef}
@@ -553,13 +684,16 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
                     autoComplete="off"
                     autoCorrect="off"
                     id="main-cmd-input"
-                    onFocus={this.handleMainFocus}
+                    onFocus={this.handleFocus}
                     onBlur={this.handleMainBlur}
                     style={{ height: computedInnerHeight, minHeight: computedInnerHeight, fontSize: termFontSize }}
                     value={curLine}
                     onKeyDown={this.onKeyDown}
                     onChange={this.onChange}
-                    className={cn("textarea", { "display-disabled": disabled })}
+                    onSelect={this.onSelect}
+                    placeholder="Type here..."
+                    maxLength={MaxInputLength}
+                    className={clsx("textarea", { "display-disabled": auxViewFocused })}
                 ></textarea>
                 <input
                     key="history"
@@ -569,7 +703,8 @@ class TextAreaInput extends React.Component<{ onHeightChange: () => void }, {}> 
                     autoCorrect="off"
                     className="history-input"
                     type="text"
-                    onFocus={this.handleHistoryFocus}
+                    onFocus={this.handleFocus}
+                    onBlur={this.handleHistoryBlur}
                     onKeyDown={this.onHistoryKeyDown}
                     onChange={this.handleHistoryInput}
                     value={inputModel.historyQueryOpts.get().queryStr}

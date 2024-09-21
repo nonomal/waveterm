@@ -3,17 +3,7 @@
 
 import * as React from "react";
 import * as mobxReact from "mobx-react";
-import * as mobx from "mobx";
-import type {
-    RendererModelInitializeParams,
-    RendererPluginType,
-    RendererModel,
-    RendererContainerType,
-} from "../../types/types";
-import { debounce, throttle } from "throttle-debounce";
-
-type OV<V> = mobx.IObservableValue<V>;
-type CV<V> = mobx.IComputedValue<V>;
+import { debounce } from "throttle-debounce";
 
 @mobxReact.observer
 class IncrementalRenderer extends React.Component<
@@ -34,7 +24,7 @@ class IncrementalRenderer extends React.Component<
 
     constructor(props: any) {
         super(props);
-        let { rendererContainer, lineId, plugin, initParams } = this.props;
+        const { rendererContainer, lineId, plugin, initParams } = this.props;
         this.model = plugin.modelCtor();
         this.model.initialize(initParams);
         rendererContainer.registerRenderer(lineId, this.model);
@@ -50,7 +40,7 @@ class IncrementalRenderer extends React.Component<
             this.props.onHeightChange();
         }
         if (this.wrapperDivRef.current != null) {
-            let height = this.wrapperDivRef.current.offsetHeight;
+            const height = this.wrapperDivRef.current.offsetHeight;
             this.updateHeight_debounced(height);
         }
     }
@@ -71,7 +61,7 @@ class IncrementalRenderer extends React.Component<
     }
 
     componentWillUnmount() {
-        let { rendererContainer, lineId } = this.props;
+        const { rendererContainer, lineId } = this.props;
         rendererContainer.unloadRenderer(lineId);
         if (this.rszObs != null) {
             this.rszObs.disconnect();
@@ -84,8 +74,8 @@ class IncrementalRenderer extends React.Component<
     }
 
     render() {
-        let { plugin } = this.props;
-        let Comp = plugin.fullComponent;
+        const { plugin } = this.props;
+        const Comp = plugin.fullComponent;
         if (Comp == null) {
             <div ref={this.wrapperDivRef}>(no component found in plugin)</div>;
         }

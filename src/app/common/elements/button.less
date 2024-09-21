@@ -1,0 +1,132 @@
+.wave-button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    outline: inherit;
+    display: flex;
+    padding: 6px 16px;
+    align-items: center;
+    gap: 4px;
+    border-radius: 6px;
+    height: auto;
+    line-height: 1.5;
+    white-space: nowrap;
+    user-select: none;
+
+    color: var(--form-element-text-color);
+    background: var(--form-element-primary-color);
+    i {
+        fill: var(--form-element-text-color);
+    }
+
+    &.primary {
+        color: var(--form-element-primary-text-color);
+        background: var(--form-element-primary-color);
+        i {
+            fill: var(--form-element-text-color);
+        }
+    }
+
+    &.primary.danger {
+        background: var(--app-error-color);
+    }
+
+    &.primary.outlined {
+        background: none;
+        border: 1px solid var(--form-element-primary-color);
+
+        i {
+            fill: var(--form-element-primary-color);
+        }
+    }
+
+    &.primary.greyoutlined {
+        background: none;
+        border: 1px solid var(--app-text-secondary-color);
+
+        i {
+            fill: var(--app-text-secondary-color);
+        }
+    }
+
+    &.primary.outlined,
+    &.primary.greyoutlined {
+        &.hover-danger:hover {
+            color: var(--form-element-primary-text-color);
+            border: 1px solid var(--app-error-color);
+            background: var(--app-error-color);
+        }
+    }
+
+    &.primary.outlined.danger {
+        background: none;
+        border: 1px solid var(--app-error-color);
+
+        i {
+            fill: var(--app-error-color);
+        }
+    }
+
+    &.greytext {
+        color: var(--app-text-secondary-color);
+    }
+
+    &.primary.ghost {
+        background: none;
+        i {
+            fill: var(--form-element-primary-color);
+        }
+    }
+
+    &.primary.ghost.danger {
+        background: none;
+        i {
+            fill: var(--app-error-color);
+        }
+    }
+
+    &.secondary {
+        color: var(--form-element-text-color);
+        background: var(--form-element-secondary-color);
+        i {
+            fill: var(--form-element-text-color);
+        }
+    }
+
+    &.secondary.outlined {
+        background: none;
+        border: 1px solid var(--form-element-text-color);
+    }
+
+    &.secondary.outlined.danger {
+        background: none;
+        border: 1px solid var(--app-error-color);
+    }
+
+    &.secondary.ghost {
+        background: none;
+    }
+
+    &.secondary.danger {
+        color: var(--app-error-color);
+    }
+
+    &.small {
+        padding: 4px 8px;
+        font-size: 12px;
+        border-radius: 3.6px;
+    }
+
+    &.term-inline {
+        padding: 2px 8px;
+        border-radius: 3px;
+    }
+
+    &.disabled {
+        opacity: 0.5;
+    }
+
+    &.link-button {
+        cursor: pointer;
+    }
+}
